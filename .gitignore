@@ -1,0 +1,39 @@
+# Build output
+Debug/
+Release/
+
+# STM32CubeIDE generated
+**/Debug/
+**/Release/
+
+# Temporary files
+*.o
+*.d
+*.su
+*.map
+*.elf
+*.hex
+*.bin
+*.list
+
+# IDE metadata
+.settings/
+.metadata/
+*.launch
+
+# Eclipse
+.project
+.cproject
+
+# (Оставьте эти строки закомментированными,
+# если хотите, чтобы проект открывался у других)
+# .project
+# .cproject
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*~
+*.bak
