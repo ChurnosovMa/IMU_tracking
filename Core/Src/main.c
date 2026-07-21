@@ -184,8 +184,6 @@ int main(void)
   HAL_Delay(500);
   if (BNO_Init() == HAL_OK) {
       printf("BNO сенсор найден!\r\n");
-      BNO_setFeature(MAGNETIC_FIELD_CALIBRATED, 13333, 0);
-      HAL_Delay(100);
       BNO_setFeature(ROTATION_VECTOR,           13333, 0);
       HAL_Delay(100);
   } else {
@@ -196,10 +194,7 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  BNO_RotationVector_t last_quat = {0};
-  BNO_MagneticField_t last_bno_mag = {0};
-
-  int16_t mx, my, mz;
+  BNO_RotationVectorWAcc_t quat = {0};
 
   char msg[500];
   while (1)
@@ -212,30 +207,15 @@ int main(void)
 		switch(sensorData.sensorId)
 		{
 			case ROTATION_VECTOR:
-				last_quat = getGameRotationVector();  // или raw quaternion
-				break;
-
-			case MAGNETIC_FIELD_CALIBRATED:
-				last_bno_mag = getMagneticField();   // ВАЖНО: сразу сохраняем
-				break;
+				quat = getRotationVector();  // или raw quaternion
+				brSeak;
 		}
 	}
 
-	int mag_ok = mag_read_raw(&mx, &my, &mz);
-
-	if (mag_ok)
-	{
-		int n = snprintf(msg, sizeof(msg),
-			"%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%d,%d,%d\r\n",
-			last_quat.I, last_quat.J, last_quat.K, last_quat.Real,
-			last_bno_mag.X, last_bno_mag.Y, last_bno_mag.Z,
-			mx, my, mz);
-
-		if (n > 0 && n < (int)sizeof(msg))
-		{
-			HAL_UART_Transmit(&huart2, (uint8_t*)msg, n, 1000);
-		}
-	}
+	int n = snprintf(msg, sizeof(msg),
+			"%.3f,%.3f,%.3f,%.3f\r\n",
+			quat.I, quat.J, quat.K, quat.Real);
+	HAL_UART_Transmit(&huart2, (uint8_t*)msg, n, 1000);
 
 	HAL_Delay(1);
   /* USER CODE END 3 */
