@@ -135,34 +135,34 @@ int main(void)
   printf("INT pin state: %d\r\n",
       HAL_GPIO_ReadPin(BNO_INT_GPIO_Port, BNO_INT_Pin));
   HAL_Delay(100);
-
+// Закоментированная часть с датчиком BNO
   // Вручную сбрасываем сенсор
-  HAL_GPIO_WritePin(BNO_RST_GPIO_Port, BNO_RST_Pin, GPIO_PIN_RESET); // RST = 0
-  HAL_Delay(100);
-  HAL_GPIO_WritePin(BNO_RST_GPIO_Port, BNO_RST_Pin, GPIO_PIN_SET);   // RST = 1
-  HAL_Delay(1000);
-  printf("Сканирование I2C...\r\n");
-  uint8_t found = 0;
-
-  for (uint8_t addr = 1; addr < 128; addr++) {
-      if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 2, 10) == HAL_OK) {
-          printf("Найдено: 0x%02X\r\n", addr);
-          found++;
-      }
-  }
-  if (!found) printf("Устройств не найдено!\r\n");
-  BNO_Ready = 1;
-  HAL_Delay(500);
-  if (BNO_Init() == HAL_OK) {
-      printf("BNO сенсор найден!\r\n");
-      BNO_setFeature(MAGNETIC_FIELD_CALIBRATED, 13333, 0);
-      HAL_Delay(100);
-      BNO_setFeature(ROTATION_VECTOR,           13333, 0);
-      HAL_Delay(100);
-  } else {
-      printf("ОШИБКА: сенсор не отвечает!\r\n");
-      Error_Handler();
-  }
+//  HAL_GPIO_WritePin(BNO_RST_GPIO_Port, BNO_RST_Pin, GPIO_PIN_RESET); // RST = 0
+//  HAL_Delay(100);
+//  HAL_GPIO_WritePin(BNO_RST_GPIO_Port, BNO_RST_Pin, GPIO_PIN_SET);   // RST = 1
+//  HAL_Delay(1000);
+//  printf("Сканирование I2C...\r\n");
+//  uint8_t found = 0;
+//
+//  for (uint8_t addr = 1; addr < 128; addr++) {
+//      if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 2, 10) == HAL_OK) {
+//          printf("Найдено: 0x%02X\r\n", addr);
+//          found++;
+//      }
+//  }
+//  if (!found) printf("Устройств не найдено!\r\n");
+//  BNO_Ready = 1;
+//  HAL_Delay(500);
+//  if (BNO_Init() == HAL_OK) {
+//      printf("BNO сенсор найден!\r\n");
+//      BNO_setFeature(MAGNETIC_FIELD_CALIBRATED, 13333, 0);
+//      HAL_Delay(100);
+//      BNO_setFeature(ROTATION_VECTOR,           13333, 0);
+//      HAL_Delay(100);
+//  } else {
+//      printf("ОШИБКА: сенсор не отвечает!\r\n");
+//      Error_Handler();
+//  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -193,19 +193,12 @@ int main(void)
 
 
     sprintf(tx,
-        "%.3f %.3f %.3f %.3f %.4f %.4f %.4f %.4f %.4f %.4f %.4f"
-        "%.3f %.3f %.3f %.3f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\r\n",
-        imu1.dt,
-        imu1.Ax, imu1.Ay, imu1.Az,
-        imu1.Gx, imu1.Gy, imu1.Gz,
-        imu1.q0, imu1.q1, imu1.q2, imu1.q3,
-        imu2.dt,
-        imu2.Ax, imu2.Ay, imu2.Az,
-        imu2.Gx, imu2.Gy, imu2.Gz,
-        imu2.q0, imu2.q1, imu2.q2, imu2.q3
-    );
+            "%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\r\n",
+            imu1.q0, imu1.q1, imu1.q2, imu1.q3,
+            imu2.q0, imu2.q1, imu2.q2, imu2.q3
+        );
 
-    HAL_UART_Transmit(&huart2, (uint8_t*)tx, strlen(tx), HAL_MAX_DELAY);
+        HAL_UART_Transmit(&huart2, (uint8_t*)tx, strlen(tx), HAL_MAX_DELAY);
 
 //    char msg[] = "UART OK\r\n";
 //
