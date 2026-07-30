@@ -55,7 +55,7 @@ void MPU6050_Calibrate(I2C_HandleTypeDef *I2Cx,
     DataStruct->Gyro_Z_offset = ((float)gz_sum / samples) / 131.0f;
 
     DataStruct->IsCalibrated = 1;
-    DataStruct->dwt_timer = HAL_GetTick();
+    DataStruct->dwt_timer = DWT->CYCCNT;
 }
 
 uint8_t MPU6050_Init(I2C_HandleTypeDef *I2Cx, MPU6050_t *mpu)
@@ -63,6 +63,12 @@ uint8_t MPU6050_Init(I2C_HandleTypeDef *I2Cx, MPU6050_t *mpu)
     uint8_t check = 0;
     uint8_t Data;
     HAL_StatusTypeDef st;
+    // Добавлено дополнительное сбрасывание датчика при нажатии кнопки reset
+    Data = 0x80;
+    HAL_I2C_Mem_Write(I2Cx, mpu->Address, PWR_MGMT_1_REG, 1, &Data, 1, i2c_timeout);
+    HAL_Delay(100); // датчику нужно время подняться после reset
+    Data = 0x00;
+    HAL_I2C_Mem_Write(I2Cx, mpu->Address, PWR_MGMT_1_REG, 1, &Data, 1, i2c_timeout);
 
     st = HAL_I2C_Mem_Read(I2Cx, mpu->Address, WHO_AM_I_REG, 1, &check, 1, i2c_timeout);
 

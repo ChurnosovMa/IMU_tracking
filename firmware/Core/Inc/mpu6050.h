@@ -31,6 +31,7 @@ typedef struct
 
     uint16_t Address;
     float Gyro_X_offset, Gyro_Y_offset, Gyro_Z_offset;   // в град/с, до перевода в рад
+    float Accel_X_offset, Accel_Y_offset, Accel_Z_offset; // в единицах g
     uint8_t IsCalibrated;
     float dt;
 } MPU6050_t;
