@@ -11,7 +11,7 @@
 #include <stdbool.h>
 #include "BNO_08x_I2C.h"
 #include "main.h"    // ← добавьте эту строку
-extern I2C_HandleTypeDef hi2c1;
+extern I2C_HandleTypeDef hi2c2;
 extern TIM_HandleTypeDef htim2;
 
 
@@ -19,7 +19,7 @@ extern TIM_HandleTypeDef htim2;
 
 // The interrupt variable
 extern volatile uint8_t BNO_Ready;
-//extern volatile uint8_t i2c1_transfer_complete;
+//extern volatile uint8_t i2c2_transfer_complete;
 //A monotonically incrementing uint8_t that rolls over. It is used to detect missing commands and to synchronize responses
 //static uint8_t commandSequenceNumber = 0;
 // Similar with  the above var
@@ -205,15 +205,15 @@ static HAL_StatusTypeDef sendPacket(const uint8_t channelNumber) {
 
     // Send packet to IMU
     #ifdef USE_I2C_DMA
-        //i2c1_transfer_complete = 0;  // Reset DMA transfer complete flag
-        if (HAL_I2C_Master_Transmit_DMA(&hi2c1, BNO_W_ADDR, bufferIO, dataLength) != HAL_OK) {
+        //i2c2_transfer_complete = 0;  // Reset DMA transfer complete flag
+        if (HAL_I2C_Master_Transmit_DMA(&hi2c2, BNO_W_ADDR, bufferIO, dataLength) != HAL_OK) {
             return HAL_ERROR;  // Return error if DMA transmission fails
         }
         // Wait for DMA transfer to complete
-        //while (!i2c1_transfer_complete);
-				while (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY) { }
+        //while (!i2c2_transfer_complete);
+				while (HAL_I2C_GetState(&hi2c2) != HAL_I2C_STATE_READY) { }
     #else
-        if (HAL_I2C_Master_Transmit(&hi2c1, BNO_W_ADDR, bufferIO, dataLength, HAL_MAX_DELAY) != HAL_OK) {
+        if (HAL_I2C_Master_Transmit(&hi2c2, BNO_W_ADDR, bufferIO, dataLength, HAL_MAX_DELAY) != HAL_OK) {
             return HAL_ERROR;  // Return error if transmission fails
         }
     #endif
@@ -266,15 +266,15 @@ static HAL_StatusTypeDef receivePacket(void) {
 
     // First, receive the header (4 bytes) to determine the full packet size
     #ifdef USE_I2C_DMA
-        //i2c1_transfer_complete = 0;  // Reset DMA transfer complete flag
-        if (HAL_I2C_Master_Receive_DMA(&hi2c1, BNO_R_ADDR, bufferIO, HEADER_SIZE) != HAL_OK) {
+        //i2c2_transfer_complete = 0;  // Reset DMA transfer complete flag
+        if (HAL_I2C_Master_Receive_DMA(&hi2c2, BNO_R_ADDR, bufferIO, HEADER_SIZE) != HAL_OK) {
             return HAL_ERROR;  // Return error if DMA reception fails
         }
         // Wait for DMA transfer to complete
-        //while (!i2c1_transfer_complete);
-				while (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY) { }
+        //while (!i2c2_transfer_complete);
+				while (HAL_I2C_GetState(&hi2c2) != HAL_I2C_STATE_READY) { }
     #else
-        if (HAL_I2C_Master_Receive(&hi2c1, BNO_R_ADDR, bufferIO, HEADER_SIZE, HAL_MAX_DELAY) != HAL_OK) {
+        if (HAL_I2C_Master_Receive(&hi2c2, BNO_R_ADDR, bufferIO, HEADER_SIZE, HAL_MAX_DELAY) != HAL_OK) {
             return HAL_ERROR;  // Return error if reception fails
         }
     #endif
@@ -289,15 +289,15 @@ static HAL_StatusTypeDef receivePacket(void) {
 
     // Now, receive the full packet based on the calculated size
     #ifdef USE_I2C_DMA
-        //i2c1_transfer_complete = 0;  // Reset DMA transfer complete flag
-        if (HAL_I2C_Master_Receive_DMA(&hi2c1, BNO_R_ADDR, bufferIO, rxPacketLength) != HAL_OK) {
+        //i2c2_transfer_complete = 0;  // Reset DMA transfer complete flag
+        if (HAL_I2C_Master_Receive_DMA(&hi2c2, BNO_R_ADDR, bufferIO, rxPacketLength) != HAL_OK) {
             return HAL_ERROR;  // Return error if DMA reception fails
         }
         // Wait for DMA transfer to complete
-        //while (!i2c1_transfer_complete);
-				while (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY) { }
+        //while (!i2c2_transfer_complete);
+				while (HAL_I2C_GetState(&hi2c2) != HAL_I2C_STATE_READY) { }
     #else
-        if (HAL_I2C_Master_Receive(&hi2c1, BNO_R_ADDR, bufferIO, rxPacketLength, HAL_MAX_DELAY) != HAL_OK) {
+        if (HAL_I2C_Master_Receive(&hi2c2, BNO_R_ADDR, bufferIO, rxPacketLength, HAL_MAX_DELAY) != HAL_OK) {
             return HAL_ERROR;  // Return error if reception fails
         }
     #endif

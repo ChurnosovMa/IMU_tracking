@@ -40,7 +40,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define BNO_REPORT_INTERVAL_US  10000U   // 10 ms -> 100 Hz rotation-vector reports
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -53,7 +53,6 @@
 /* USER CODE BEGIN PV */
 MPU6050_t MPU6050;
 volatile uint8_t BNO_Ready = 0;
-
 float roll1, pitch1, yaw1;
 float roll2, pitch2, yaw2;
 
@@ -82,6 +81,16 @@ static inline void DWT_DelayUs(uint32_t us)
     while ((DWT->CYCCNT - start) < cycles) { }
 }
 
+// BNO_INT (PA9) drives this HAL callback; it is what wakes waitInt() inside the BNO driver.
+// If your project already defines HAL_GPIO_EXTI_Callback elsewhere, merge this into it
+// instead of defining it twice (the linker will reject duplicates).
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == BNO_INT_Pin)
+    {
+        BNO_Ready = 1;
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -135,34 +144,25 @@ int main(void)
   printf("INT pin state: %d\r\n",
       HAL_GPIO_ReadPin(BNO_INT_GPIO_Port, BNO_INT_Pin));
   HAL_Delay(100);
-// Закоментированная часть с датчиком BNO
-  // Вручную сбрасываем сенсор
-//  HAL_GPIO_WritePin(BNO_RST_GPIO_Port, BNO_RST_Pin, GPIO_PIN_RESET); // RST = 0
-//  HAL_Delay(100);
-//  HAL_GPIO_WritePin(BNO_RST_GPIO_Port, BNO_RST_Pin, GPIO_PIN_SET);   // RST = 1
-//  HAL_Delay(1000);
-//  printf("Сканирование I2C...\r\n");
-//  uint8_t found = 0;
-//
-//  for (uint8_t addr = 1; addr < 128; addr++) {
-//      if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 2, 10) == HAL_OK) {
-//          printf("Найдено: 0x%02X\r\n", addr);
-//          found++;
-//      }
-//  }
-//  if (!found) printf("Устройств не найдено!\r\n");
-//  BNO_Ready = 1;
-//  HAL_Delay(500);
-//  if (BNO_Init() == HAL_OK) {
-//      printf("BNO сенсор найден!\r\n");
-//      BNO_setFeature(MAGNETIC_FIELD_CALIBRATED, 13333, 0);
-//      HAL_Delay(100);
-//      BNO_setFeature(ROTATION_VECTOR,           13333, 0);
-//      HAL_Delay(100);
-//  } else {
-//      printf("ОШИБКА: сенсор не отвечает!\r\n");
-//      Error_Handler();
-//  }
+
+  uint8_t bnoReady = 0;
+  if (BNO_Init() == HAL_OK)
+  {
+      printf("BNO08x found!\r\n");
+      // Absolute fused orientation, already sensor-calibrated on-chip
+      if (BNO_setFeature(ROTATION_VECTOR, BNO_REPORT_INTERVAL_US, 0) == HAL_OK)
+      {
+          bnoReady = 1;
+      }
+      else
+      {
+          printf("BNO: failed to enable ROTATION_VECTOR\r\n");
+      }
+  }
+  else
+  {
+      printf("BNO: sensor not responding!\r\n");
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -175,39 +175,26 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-
 	MPU6050_Read_All(&hi2c1, &imu1);
 	MPU6050_Read_All(&hi2c1, &imu2);
+
+	if (bnoReady && BNO_dataAvailable() == HAL_OK)
+	{
+	    if (BNO_getSensorEventID() == ROTATION_VECTOR)
+	    {
+	        quat = getRotationVector();
+	    }
+	}
+
     char tx[512];
-
-//    sprintf(tx,
-//            "%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\r\n",
-//			imu1.q0,
-//			imu1.q1,
-//			imu1.q2,
-//			imu1.q3,
-//			imu2.q0,
-//			imu2.q1,
-//			imu2.q2,
-//			imu2.q3);
-
-
     sprintf(tx,
-            "%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\r\n",
+            "%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\r\n",
             imu1.q0, imu1.q1, imu1.q2, imu1.q3,
-            imu2.q0, imu2.q1, imu2.q2, imu2.q3
+            imu2.q0, imu2.q1, imu2.q2, imu2.q3,
+			quat.Real, quat.I, quat.J, quat.K
         );
 
-        HAL_UART_Transmit(&huart2, (uint8_t*)tx, strlen(tx), HAL_MAX_DELAY);
-
-//    char msg[] = "UART OK\r\n";
-//
-//    HAL_UART_Transmit(&huart2,
-//                      (uint8_t *)msg,
-//                      sizeof(msg) - 1,
-//                      HAL_MAX_DELAY);
-//
-
+    HAL_UART_Transmit(&huart2, (uint8_t*)tx, strlen(tx), HAL_MAX_DELAY);
   }
   /* USER CODE END 3 */
 }

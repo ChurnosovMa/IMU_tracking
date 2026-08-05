@@ -1,53 +1,73 @@
 """
-Приём ДВУХ кватернионов с UART и визуализация модели "плечо + предплечье"
-со свободной 3D-камерой.
+Приём ДВУХ кватернионов с UART и визуализация модели "плечо + предплечье".
 
-БАЗА: ваша версия с исправленным знаком оси (axis_from_total_rotation) и
-синхронизацией фреймов (q_upper_cal_raw / q_fore_cal_raw), БЕЗ клампинга угла
-локтя — вернулись к ней, т.к. клампинг не решал проблему "сгибания при
-поднятии прямой руки" (он и не мог: он только обрезает диапазон, а не лечит
-причину рассогласования).
+ВЕРСИЯ С ОДНОЙ МИНИМАЛЬНОЙ КАЛИБРОВКОЙ (поза "рука вниз").
 
-ДОБАВЛЕНО: диагностика для поиска причины "сгибания" при поднятии прямой руки.
+Идея: датчик даёт АБСОЛЮТНУЮ ориентацию (кватернион уже привязан к гравитации
+через встроенный фьюжн MPU6050), но ось, вдоль которой физически направлена
+кость, В СОБСТВЕННЫХ координатах датчика зависит от того, КАК ИМЕННО датчик
+приклеен к руке - заранее это направление неизвестно и константой не
+задаётся. Поэтому раньше "рука вниз" не давала 0° - мы предполагали не то
+направление.
 
-  - В заголовок окна теперь ВСЕГДА (при включённой функц. калибровке) выводится:
-      flex   - угол сгибания локтя (180 = прямая рука), БЕЗ клампинга
-      swing  - "паразитное" отклонение вне оси сгибания (в идеале ~0 всегда,
-               для истинного шарнира). Если swing растёт вместе с подъёмом
-               плеча - это явный признак рассинхронизации/наводки между
-               датчиками, а не реальное движение в локте.
-      shoulder - на сколько градусов текущая поза плеча отличается от позы
-               калибровки (грубый индикатор "насколько поднята рука").
+Решение - одна простая калибровка: встать в позу "рука вдоль тела, вниз" и
+ЗАМЕРИТЬ, куда в координатах ДАТЧИКА сейчас "смотрит" гравитация. Это
+направление (в системе датчика) и есть искомая продольная ось кости - именно
+её нужно поворачивать кватернионом на каждом кадре, чтобы получать текущее
+направление кости в мире. Никакого другого измерения (движения, PCA и т.п.)
+не требуется - это буквально одна статичная поза, один снятый вектор на
+каждый датчик.
 
-  - Клавиша P -> печатает пронумерованный снимок в консоль (flex, swing,
-    shoulder, а также сырые кватернионы). Используйте так:
-        1) держите руку прямо ВНИЗ (поза калибровки) -> P
-        2) прямая рука ВПЕРЁД -> P
-        3) прямая рука В СТОРОНУ (вправо) -> P
-        4) прямая рука ПОДНЯТА НА ~90° -> P
-    Если flex остаётся близко к 180 на всех четырёх точках - калибровка в
-    порядке, и дело в динамике движения (см. ниже). Если flex ощутимо и
-    ПОВТОРЯЕМО падает с ростом shoulder - это систематическая ошибка калибровки
-    осей, а не шум/рассинхрон.
+Нам сейчас всё ещё не нужен угол прецессии (поворот плоскости движения руки
+вокруг вертикали - придёт с 3-м датчиком на груди). Нужен только УГОЛ
+НУТАЦИИ - насколько рука отклонена от вертикали.
 
-ВАЖНО ПРО ФИЗИКУ: если локоть держится идеально жёстко (не сгибается на самом
-деле), относительный угол между сегментами МАТЕМАТИЧЕСКИ обязан оставаться
-постоянным при любом общем повороте руки в плече - калибровочные ошибки в
-общий поворот не проникают (они сокращаются при вычитании ориентаций). Поэтому
-если угол всё равно "гуляет" при поднятии прямой руки - ищите причину не в
-самой калибровке осей, а в одном из двух мест:
-  (a) сам локоть в реальности не абсолютно неподвижен при подъёме (это очень
-      легко упустить - большинство людей не держат руку идеально прямой без
-      сознательного усилия);
-  (b) два датчика читаются с рассинхроном по времени на стороне MCU (если
-      цикл опроса читает сначала один MPU6050, потом другой, при быстром
-      движении между чтениями пройдёт время, и получится кажущийся "изгиб",
-      пропорциональный скорости движения - должен пропадать, если ОСТАНОВИТЬ
-      руку и подождать).
-Так что стоит проверить отдельно: поднимаете руку быстро -> изгиб есть;
-останавливаетесь и ждёте секунду -> изгиб исчезает? Если исчезает - это (b).
-Если сохраняется в статике - это (a) или систематическая ошибка осей (тогда
-сработает тест с 4 референсными позами выше).
+ВАЖНО (исправленная версия): нутация считается КАК УГОЛ МЕЖДУ НАПРАВЛЕНИЕМ
+КОСТИ И ВЕРТИКАЛЬЮ НАПРЯМУЮ (через arccos скалярного произведения), БЕЗ
+проекции на какую-либо плоскость. Раньше здесь была математическая ошибка:
+угол считался через проекцию направления кости на плоскость Y-Z (с
+отбрасыванием компоненты по оси X) и потом через atan2 - но вращение вокруг
+вертикали (Y) физически ПЕРЕМЕШИВАЕТ компоненты X и Z, поэтому попытка
+"убрать только X" не может быть инвариантна к повороту тела вокруг себя:
+часть настоящего движения руки терялась, а часть паразитного поворота тела
+добавлялась в результат. Отсюда и "рука гнётся сама по себе при повороте
+тела" и "прямая рука выглядит согнутой".
+
+arccos-формула лишена этой проблемы: угол вектора К ОСИ ВРАЩЕНИЯ не может
+измениться от вращения вокруг этой же оси - это просто такое свойство
+вращений, не требует никаких оговорок или доп. условий. Плата за это -
+у нутации нет знака (0°..180°, без "стороны"): куда именно повёрнута рука
+(вперёд/назад/влево/вправо) при одной и той же нутации не различить - это
+работа будущего 3-го датчика (прецессия).
+
+Порядок расчёта на каждом кадре:
+
+  1) Берём "продольную ось кости" В СОБСТВЕННОЙ (уже переразмеченной через
+     AXIS_REMAP) системе координат датчика - НЕ константу, а то, что
+     ЗАМЕРЕНО калибровкой (см. выше).
+  2) Поворачиваем эту ось кватернионом датчика - получаем, куда кость
+     СЕЙЧАС направлена в МИРОВЫХ координатах.
+  3) Угол между результатом и направлением "вниз" (0,-1,0), через
+     arccos(скалярное произведение) - это и есть нутация. Благодаря
+     калибровке из шага 1 - в самой позе калибровки этот угол честно
+     равен 0°.
+
+  Угол плеча = это же самое для датчика на плече.
+  Угол предплечья = это же самое для датчика на предплечье (тоже абсолютный,
+      относительно вертикали, а не относительно плеча!).
+  Угол в локте = угол_предплечья - угол_плеча (разность соседних абсолютных
+      углов - работает, ПОКА оба сегмента действительно находятся в одной
+      плоскости относительно тела, т.е. пока нет независимого движения
+      "вбок" одного сегмента без другого).
+
+Управление калибровкой:
+    G  -> старт/стоп записи позы "рука вниз, локоть прямой" (для ОБОИХ
+          датчиков сразу - постоять неподвижно ~2-3 сек, G ещё раз стоп)
+
+Когда добавите 3-й датчик (на груди): он даст угол прецессии - куда именно
+(в какую сторону) сейчас "смотрит" плоскость движения руки относительно
+тела. Сама нутация (этот файл) не изменится - прецессия дополнит её, а не
+заменит.
 
 Установка зависимостей:
     pip install pyserial pygame PyOpenGL PyOpenGL_accelerate numpy
@@ -72,13 +92,26 @@ BAUDRATE = 115200
 # ======================= НАСТРОЙКИ МОДЕЛИ =======================
 UPPER_ARM_LENGTH = 3.0
 UPPER_ARM_RADIUS = 0.4
-UPPER_ARM_AXIS = "y"
+UPPER_ARM_AXIS = "y"     # локальная ось датчика, вдоль которой направлена кость плеча
 UPPER_ARM_SIGN = -1
 
 FOREARM_LENGTH = 2.6
 FOREARM_RADIUS = 0.32
-FOREARM_AXIS = "y"
+FOREARM_AXIS = "y"       # локальная ось датчика, вдоль которой направлено предплечье
 FOREARM_SIGN = -1
+
+# Ось, вокруг которой мы поворачиваем 3D-модель на экране (ЧИСТО для
+# отрисовки - к самому расчёту угла нутации отношения больше не имеет,
+# см. объяснение выше и функцию nutation_angle_deg ниже). Раньше эта ось
+# ошибочно использовалась и в самом расчёте угла - это и было источником
+# бага "поворот тела меняет позу руки на экране": вращение вокруг Y
+# (вертикали) математически ПЕРЕМЕШИВАЕТ компоненты X и Z, поэтому попытка
+# "убрать X и мерить угол в Y-Z" не может быть инвариантна к вращению вокруг
+# Y - часть настоящего движения руки утекала в X и терялась, а часть
+# паразитного вращения тела утекала в Z и добавлялась в угол. Правильная
+# нутация (см. ниже) вообще не использует эту ось для расчёта - только
+# для того, чтобы было вокруг чего вращать модель на экране.
+RENDER_AXIS = (1.0, 0.0, 0.0)
 # ==================================================================
 
 quat_lock = threading.Lock()
@@ -88,29 +121,18 @@ running = True
 
 IDENTITY_QUAT = (1.0, 0.0, 0.0, 0.0)
 
-# --- "поза = ноль" калибровка (сырые снимки датчиков в момент SPACE) ---
+# --- калибровка "рука вниз": продольная ось кости В КООРДИНАТАХ ДАТЧИКА ---
+# Заполняется один раз через клавишу G (см. try_compute_calibration ниже).
+# До калибровки - None, нутацию считать нельзя (программа явно это покажет).
 cal_lock = threading.Lock()
-upper_quat_cal = IDENTITY_QUAT
-fore_quat_cal = IDENTITY_QUAT
+local_bone_axis_upper = None
+local_bone_axis_fore = None
 is_calibrated = False
 
-# --- функциональная (анатомическая) калибровка ---
-func_lock = threading.Lock()
-seg2sensor_upper = IDENTITY_QUAT
-seg2sensor_fore = IDENTITY_QUAT
-functional_calibrated = False
-
-CAPTURE_NONE, CAPTURE_GRAVITY, CAPTURE_SHOULDER, CAPTURE_ELBOW = range(4)
+CAPTURE_NONE, CAPTURE_DOWN = range(2)
 capture_mode = CAPTURE_NONE
 buf_upper = []
 buf_fore = []
-
-gravity_upper_S = None
-gravity_fore_S = None
-shoulder_axis_upper_S = None
-elbow_axis_fore_S = None
-
-snapshot_counter = 0
 
 
 # --------------------- Кватернионная математика ---------------------
@@ -131,15 +153,9 @@ def quat_multiply(q1, q2):
     )
 
 
-def quat_normalize(q):
-    w, x, y, z = q
-    n = math.sqrt(w * w + x * x + y * y + z * z)
-    if n < 1e-9:
-        return IDENTITY_QUAT
-    return (w / n, x / n, y / n, z / n)
-
-
 def rotate_vector_by_quat(q, v):
+    """Повернуть вектор v (заданный в локальной СК датчика) кватернионом q -
+    получаем этот же вектор, но выраженный в МИРОВОЙ СК."""
     qv = (0.0, v[0], v[1], v[2])
     r = quat_multiply(quat_multiply(q, qv), quat_conjugate(q))
     return (r[1], r[2], r[3])
@@ -159,20 +175,15 @@ def euler_to_quat(rx_deg, ry_deg, rz_deg):
     return quat_multiply(qz, quat_multiply(qy, qx))
 
 
+# Переразметка осей сырого кватерниона датчика в удобную для нас СК
+# (как и в самой первой версии скрипта - физическая ориентация платы датчика
+# на теле не совпадает с осями, в которых нам удобно считать, этот поворот
+# компенсирует разницу один раз и одинаково для всех кадров).
 AXIS_REMAP = euler_to_quat(rx_deg=-90, ry_deg=90, rz_deg=0)
 
 
 def apply_axis_remap(q_raw):
     return quat_multiply(quat_multiply(AXIS_REMAP, q_raw), quat_conjugate(AXIS_REMAP))
-
-
-def calibrate(q_upper, q_fore):
-    global upper_quat_cal, fore_quat_cal, is_calibrated
-    with cal_lock:
-        upper_quat_cal = q_upper
-        fore_quat_cal = q_fore
-        is_calibrated = True
-    print("Калибровка позы выполнена: текущая поза = домашняя (0).")
 
 
 def quat_to_matrix(q):
@@ -190,92 +201,6 @@ def quat_to_matrix(q):
         xz + wy, yz - wx, 1 - (xx + yy), 0,
         0, 0, 0, 1,
     ]
-
-
-def matrix3_to_quat(m00, m01, m02, m10, m11, m12, m20, m21, m22):
-    trace = m00 + m11 + m22
-    if trace > 0:
-        s = 0.5 / math.sqrt(trace + 1.0)
-        w = 0.25 / s
-        x = (m21 - m12) * s
-        y = (m02 - m20) * s
-        z = (m10 - m01) * s
-    elif m00 > m11 and m00 > m22:
-        s = 2.0 * math.sqrt(1.0 + m00 - m11 - m22)
-        w = (m21 - m12) / s
-        x = 0.25 * s
-        y = (m01 + m10) / s
-        z = (m02 + m20) / s
-    elif m11 > m22:
-        s = 2.0 * math.sqrt(1.0 + m11 - m00 - m22)
-        w = (m02 - m20) / s
-        x = (m01 + m10) / s
-        y = 0.25 * s
-        z = (m12 + m21) / s
-    else:
-        s = 2.0 * math.sqrt(1.0 + m22 - m00 - m11)
-        w = (m10 - m01) / s
-        x = (m02 + m20) / s
-        y = (m12 + m21) / s
-        z = 0.25 * s
-    return quat_normalize((w, x, y, z))
-
-
-# --------------------- Функциональная калибровка ---------------------
-
-def gravity_in_sensor_frame(q_sensor_to_world):
-    q_world_to_sensor = quat_conjugate(q_sensor_to_world)
-    return rotate_vector_by_quat(q_world_to_sensor, (0.0, -1.0, 0.0))
-
-
-def angvel_axis_samples(quat_sequence):
-    samples = []
-    for i in range(len(quat_sequence) - 1):
-        q1 = quat_sequence[i]
-        q2 = quat_sequence[i + 1]
-        dq = quat_multiply(quat_conjugate(q1), q2)
-        w, x, y, z = dq
-        if w < 0:
-            x, y, z = -x, -y, -z
-        norm = math.sqrt(x * x + y * y + z * z)
-        if norm > 1e-4:
-            samples.append((x / norm, y / norm, z / norm))
-    return samples
-
-
-def dominant_axis_line(vectors):
-    if len(vectors) < 5:
-        return None
-    arr = np.array(vectors)
-    cov = arr.T @ arr / len(arr)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    return tuple(eigvecs[:, np.argmax(eigvals)])
-
-
-def axis_from_total_rotation(quat_sequence):
-    if len(quat_sequence) < 2:
-        return None
-    q_start = quat_sequence[0]
-    q_end = quat_sequence[-1]
-    dq = quat_multiply(quat_conjugate(q_start), q_end)
-    w, x, y, z = dq
-    if w < 0:
-        x, y, z = -x, -y, -z
-    norm = math.sqrt(x * x + y * y + z * z)
-    if norm < 1e-4:
-        return None
-    return (x / norm, y / norm, z / norm)
-
-
-def dominant_axis(quat_sequence):
-    samples = angvel_axis_samples(quat_sequence)
-    line = dominant_axis_line(samples)
-    if line is None:
-        return None
-    ref = axis_from_total_rotation(quat_sequence)
-    if ref is not None and v_dot(line, ref) < 0:
-        line = tuple(-c for c in line)
-    return line
 
 
 def v_norm(a):
@@ -309,119 +234,78 @@ def v_cross(a, b):
     )
 
 
-def build_segment_quat(axis_long_S, axis_flex_S):
-    e_long = v_norm(axis_long_S)
-    proj = v_dot(e_long, axis_flex_S)
-    e_flex = v_norm(v_sub(axis_flex_S, v_scale(e_long, proj)))
-    e_third = v_norm(v_cross(e_long, e_flex))
-    return matrix3_to_quat(
-        e_long[0], e_flex[0], e_third[0],
-        e_long[1], e_flex[1], e_third[1],
-        e_long[2], e_flex[2], e_third[2],
-    )
+# --------------------- Калибровка "рука вниз" + угол нутации ---------------------
+
+# Направление "рука висит вниз" в мировых координатах - точка отсчёта (0°)
+# для угла нутации.
+DOWN_WORLD = (0.0, -1.0, 0.0)
 
 
-def try_compute_functional_calibration():
-    global seg2sensor_upper, seg2sensor_fore, functional_calibrated
-    ok_upper = gravity_upper_S is not None and shoulder_axis_upper_S is not None
-    ok_fore = gravity_fore_S is not None and elbow_axis_fore_S is not None
-    if not (ok_upper and ok_fore):
-        print("Не хватает данных: нужны обе статичные позы и оба движения "
-              "(G для гравитации, F для плеча, B для локтя).")
-        return
-    with func_lock:
-        seg2sensor_upper = build_segment_quat(gravity_upper_S, shoulder_axis_upper_S)
-        seg2sensor_fore = build_segment_quat(gravity_fore_S, elbow_axis_fore_S)
-        functional_calibrated = True
-    print("Функциональная калибровка построена.")
+def gravity_in_sensor_frame(q_sensor_to_world):
+    """Направление 'вниз' (0,-1,0) в МИРОВОЙ СК, выраженное В КООРДИНАТАХ
+    ДАТЧИКА. Ровно это направление в позе 'рука вниз, локоть прямой' и есть
+    продольная ось кости, В КООРДИНАТАХ ЭТОГО КОНКРЕТНОГО ДАТЧИКА (зависит от
+    того, как именно он приклеен - поэтому и нужна калибровка, не константа)."""
+    q_world_to_sensor = quat_conjugate(q_sensor_to_world)
+    return rotate_vector_by_quat(q_world_to_sensor, DOWN_WORLD)
 
 
-def reset_functional_calibration():
-    global functional_calibrated, gravity_upper_S, gravity_fore_S
-    global shoulder_axis_upper_S, elbow_axis_fore_S
-    with func_lock:
-        functional_calibrated = False
-    gravity_upper_S = None
-    gravity_fore_S = None
-    shoulder_axis_upper_S = None
-    elbow_axis_fore_S = None
-    print("Функциональная калибровка сброшена.")
-
-
-def start_stop_capture(mode, name):
+def start_stop_capture():
     global capture_mode, buf_upper, buf_fore
-    global gravity_upper_S, gravity_fore_S, shoulder_axis_upper_S, elbow_axis_fore_S
-
     if capture_mode == CAPTURE_NONE:
-        capture_mode = mode
+        capture_mode = CAPTURE_DOWN
         buf_upper = []
         buf_fore = []
-        print(f"[{name}] запись начата — выполните позу/движение один раз...")
+        print("[рука вниз] запись начата — встаньте прямо, рука вдоль тела, "
+              "локоть прямой, постойте неподвижно ~2-3 сек...")
         return
-
-    if capture_mode != mode:
-        print("Сначала завершите текущую запись (нажмите ту же клавишу ещё раз).")
-        return
-
     capture_mode = CAPTURE_NONE
-    if mode == CAPTURE_GRAVITY:
-        if len(buf_upper) < 5:
-            print("Слишком мало сэмплов для гравитации, повторите.")
-            return
-        g_up = np.mean([gravity_in_sensor_frame(q) for q in buf_upper], axis=0)
-        g_fo = np.mean([gravity_in_sensor_frame(q) for q in buf_fore], axis=0)
-        gravity_upper_S = tuple(g_up)
-        gravity_fore_S = tuple(g_fo)
-        print(f"[{name}] готово: продольные оси захвачены.")
-    elif mode == CAPTURE_SHOULDER:
-        axis = dominant_axis(buf_upper)
-        if axis is None:
-            print("Слишком мало движения было зафиксировано, повторите увереннее.")
-            return
-        shoulder_axis_upper_S = axis
-        print(f"[{name}] готово: ось плеча захвачена.")
-    elif mode == CAPTURE_ELBOW:
-        axis = dominant_axis(buf_fore)
-        if axis is None:
-            print("Слишком мало движения было зафиксировано, повторите увереннее.")
-            return
-        elbow_axis_fore_S = axis
-        print(f"[{name}] готово: ось локтя захвачена.")
+    global local_bone_axis_upper, local_bone_axis_fore, is_calibrated
+    if len(buf_upper) < 5 or len(buf_fore) < 5:
+        print("Слишком мало сэмплов, повторите.")
+        return
+    g_up = np.mean([gravity_in_sensor_frame(q) for q in buf_upper], axis=0)
+    g_fo = np.mean([gravity_in_sensor_frame(q) for q in buf_fore], axis=0)
+    with cal_lock:
+        local_bone_axis_upper = v_norm(tuple(g_up))
+        local_bone_axis_fore = v_norm(tuple(g_fo))
+        is_calibrated = True
+    print(f"Калибровка готова. Ось плеча в СК датчика: "
+          f"{tuple(round(c, 3) for c in local_bone_axis_upper)}")
+    print(f"Ось предплечья в СК датчика: "
+          f"{tuple(round(c, 3) for c in local_bone_axis_fore)}")
 
 
-# --------------------- Диагностика (без клампинга!) ---------------------
+def nutation_angle_deg(q, local_bone_axis):
+    """
+    q               - сырой (уже переразмеченный) кватернион датчика
+    local_bone_axis - продольная ось кости В ЛОКАЛЬНОЙ СК ДАТЧИКА, полученная
+                       калибровкой "рука вниз" (см. gravity_in_sensor_frame
+                       выше) - НЕ константа, у каждого датчика своя.
 
-def quat_angle_deg(q):
-    """Величина поворота кватерниона от единичного (кратчайший путь), градусы."""
-    w = max(-1.0, min(1.0, q[0]))
-    return math.degrees(2.0 * math.acos(abs(w)))
+    НУТАЦИЯ = угол между текущим направлением кости и направлением "вниз",
+    СЧИТАЕТСЯ НАПРЯМУЮ (arccos скалярного произведения), БЕЗ проекции на
+    какую-либо плоскость. Диапазон 0°..180°, БЕЗ ЗНАКА - у нутации в
+    классическом (гироскопическом) смысле знака и не бывает, это угол
+    отклонения от полюса (вертикали), а не угол в конкретной плоскости.
 
+    Ключевое свойство этой формулы: она НЕ МЕНЯЕТСЯ при повороте всего тела
+    вокруг вертикали (прецессии) - вращение вокруг оси Y математически не
+    может изменить угол вектора К ЭТОЙ ЖЕ ОСИ Y. Именно поэтому раньше
+    (когда угол считался через проекцию на плоскость Y-Z и atan2) поворот
+    тела портил картинку - та формула была не инвариантна к прецессии,
+    хотя должна была быть. Эта - инвариантна по построению, без всяких
+    дополнительных условий.
 
-def swing_twist_around_y(q):
-    """Разложить на swing (всё, кроме вращения вокруг локальной Y) и twist
-    (вращение вокруг локальной Y — оси сгибания по калибровке)."""
-    w, x, y, z = q
-    twist = quat_normalize((w, 0.0, y, 0.0))
-    swing = quat_multiply(q, quat_conjugate(twist))
-    return swing, twist
-
-
-def twist_y_angle_deg(twist):
-    w, x, y, z = twist
-    return math.degrees(2.0 * math.atan2(y, w))
-
-
-def elbow_diagnostics(q_joint):
-    """(flex_angle_deg, swing_angle_deg) — БЕЗ клампинга, чисто для отладки.
-    flex: 180 = прямая рука (условно, знак не подобран - смотрите тренд, не
-    абсолютное число). swing: чем больше, тем сильнее локоть "гнётся" не
-    вокруг калиброванной оси сгибания - в идеале должно быть ~0 всегда,
-    рост swing вместе с подъёмом плеча = верный признак рассинхрона/наводки."""
-    swing, twist = swing_twist_around_y(q_joint)
-    theta_deg = twist_y_angle_deg(twist)
-    flex_deg = 180.0 - theta_deg
-    swing_deg = quat_angle_deg(swing)
-    return flex_deg, swing_deg
+    Плата за простоту: у угла нет знака и нет "стороны" (раскрыть, куда
+    именно повёрнута рука - вперёд, назад, влево, вправо - можно будет
+    только после 3-го датчика, который определит прецессию). Сейчас мы
+    сознательно этого не различаем.
+    """
+    world_dir = rotate_vector_by_quat(q, local_bone_axis)
+    cos_theta = v_dot(world_dir, DOWN_WORLD)
+    cos_theta = max(-1.0, min(1.0, cos_theta))  # защита от погрешностей округления
+    return math.degrees(math.acos(cos_theta))
 
 
 # --------------------- Чтение UART ---------------------
@@ -582,50 +466,35 @@ def draw_floor_grid(size=8, step=1):
     glEnd()
 
 
-# --------------------- Общий расчёт ориентации ---------------------
+# --------------------- Общий расчёт углов ---------------------
 
-def compute_current_orientation():
-    """Возвращает (q_upper_delta, q_joint, flex_deg_or_None, swing_deg_or_None,
-    shoulder_deg_or_None). БЕЗ клампинга — числа только для отображения/отладки."""
+def compute_current_angles():
+    """Возвращает (shoulder_deg, elbow_deg) - None, None, если калибровка
+    "рука вниз" (клавиша G) ещё не выполнена."""
+    with cal_lock:
+        if not is_calibrated:
+            return None, None
+        upper_local_axis = local_bone_axis_upper
+        fore_local_axis = local_bone_axis_fore
+
     with quat_lock:
         q_upper = current_upper_quat
         q_fore = current_fore_quat
 
-    with cal_lock:
-        q_upper_cal_raw = upper_quat_cal
-        q_fore_cal_raw = fore_quat_cal
+    shoulder_deg = nutation_angle_deg(q_upper, upper_local_axis)
+    forearm_abs_deg = nutation_angle_deg(q_fore, fore_local_axis)
 
-    with func_lock:
-        use_functional = functional_calibrated
-        s2s_upper = seg2sensor_upper
-        s2s_fore = seg2sensor_fore
+    # угол в локте = разница соседних АБСОЛЮТНЫХ углов (оба отсчитаны от одной
+    # и той же вертикали в одной и той же плоскости - см. докстринг вверху файла)
+    elbow_deg = forearm_abs_deg - shoulder_deg
 
-    if use_functional:
-        q_upper_seg_world = quat_multiply(q_upper, s2s_upper)
-        q_fore_seg_world = quat_multiply(q_fore, s2s_fore)
-        q_upper_cal_seg = quat_multiply(q_upper_cal_raw, s2s_upper)
-        q_fore_cal_seg = quat_multiply(q_fore_cal_raw, s2s_fore)
-
-        q_upper_delta = quat_multiply(q_upper_seg_world, quat_conjugate(q_upper_cal_seg))
-        q_rel_instant = quat_multiply(quat_conjugate(q_upper_seg_world), q_fore_seg_world)
-        q_rel_cal_seg = quat_multiply(quat_conjugate(q_upper_cal_seg), q_fore_cal_seg)
-        q_joint = quat_multiply(q_rel_instant, quat_conjugate(q_rel_cal_seg))
-
-        flex_deg, swing_deg = elbow_diagnostics(q_joint)
-        shoulder_deg = quat_angle_deg(q_upper_delta)
-        return q_upper_delta, q_joint, flex_deg, swing_deg, shoulder_deg
-    else:
-        q_rel_cal_raw = quat_multiply(quat_conjugate(q_upper_cal_raw), q_fore_cal_raw)
-        q_upper_delta = quat_multiply(q_upper, quat_conjugate(q_upper_cal_raw))
-        q_rel_instant = quat_multiply(quat_conjugate(q_upper), q_fore)
-        q_joint = quat_multiply(q_rel_instant, quat_conjugate(q_rel_cal_raw))
-        return q_upper_delta, q_joint, None, None, None
+    return shoulder_deg, elbow_deg
 
 
 # --------------------- Основной цикл ---------------------
 
 def main():
-    global running, snapshot_counter
+    global running
 
     reader = threading.Thread(target=serial_reader_thread, daemon=True)
     reader.start()
@@ -633,8 +502,7 @@ def main():
     pygame.init()
     display = (1000, 750)
     pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
-    base_caption = ("Upper Arm + Forearm Viewer | G-гравитация F-плечо B-локоть "
-                    "C-посчитать R-сброс SPACE-поза=0 P-снимок 1/2/3-виды 0-камера ESC-выход")
+    base_caption = "Nutation Viewer | G-калибровка(рука вниз) 1/2/3-виды 0-камера ESC-выход"
     pygame.display.set_caption(base_caption)
 
     glMatrixMode(GL_PROJECTION)
@@ -649,15 +517,8 @@ def main():
     clock = pygame.time.Clock()
     caption_timer = 0.0
 
-    print("Порядок функциональной калибровки:")
-    print("  1) G — рука вдоль тела, локоть прямой, стоять неподвижно ~2-3 сек, G ещё раз стоп")
-    print("  2) F — ОДНО чистое движение: локоть прямой, поднять прямую руку вперёд один раз, F стоп")
-    print("  3) B — плечо неподвижно, ОДНО чистое сгибание локтя вперёд, B стоп")
-    print("  4) C — построить калибровку. R — сбросить.")
-    print("  SPACE — обнулить текущую позу (нажимать ПОСЛЕ C).")
-    print("  P — снять диагностический снимок (для референсных поз, см. докстринг файла).")
-
-    latest = None  # последний (q_upper_delta, q_joint, flex, swing, shoulder)
+    print("Перед началом работы: G — встаньте прямо, рука вдоль тела, локоть")
+    print("прямой, постойте неподвижно ~2-3 сек, потом G ещё раз — стоп.")
 
     try:
         while running:
@@ -667,33 +528,8 @@ def main():
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
-                    elif event.key == pygame.K_SPACE:
-                        with quat_lock:
-                            q_upper_snapshot = current_upper_quat
-                            q_fore_snapshot = current_fore_quat
-                        calibrate(q_upper_snapshot, q_fore_snapshot)
                     elif event.key == pygame.K_g:
-                        start_stop_capture(CAPTURE_GRAVITY, "гравитация")
-                    elif event.key == pygame.K_f:
-                        start_stop_capture(CAPTURE_SHOULDER, "ось плеча")
-                    elif event.key == pygame.K_b:
-                        start_stop_capture(CAPTURE_ELBOW, "ось локтя")
-                    elif event.key == pygame.K_c:
-                        try_compute_functional_calibration()
-                    elif event.key == pygame.K_r:
-                        reset_functional_calibration()
-                    elif event.key == pygame.K_p:
-                        snapshot_counter += 1
-                        if latest is not None:
-                            _, _, flex_deg, swing_deg, shoulder_deg = latest
-                            with quat_lock:
-                                q_u, q_f = current_upper_quat, current_fore_quat
-                            print(f"--- снимок #{snapshot_counter} ---")
-                            print(f"  flex={flex_deg}  swing={swing_deg}  shoulder={shoulder_deg}")
-                            print(f"  q_upper_raw={q_u}")
-                            print(f"  q_fore_raw ={q_f}")
-                        else:
-                            print("Нет данных (включите функциональную калибровку сначала).")
+                        start_stop_capture()
                     elif event.key == pygame.K_1:
                         cam.set_view(azimuth=0.0, elevation=0.0)
                     elif event.key == pygame.K_2:
@@ -730,11 +566,22 @@ def main():
             draw_floor_grid()
             draw_world_axes()
 
-            latest = compute_current_orientation()
-            q_upper_delta, q_joint, flex_deg, swing_deg, shoulder_deg = latest
+            shoulder_deg, elbow_deg = compute_current_angles()
 
-            upper_matrix = quat_to_matrix(q_upper_delta)
-            joint_matrix = quat_to_matrix(q_joint)
+            # пока калибровка (G) не выполнена - рисуем модель в нулевой позе
+            # и явно показываем это в заголовке окна, а не тихо считаем как 0°
+            render_shoulder = shoulder_deg if shoulder_deg is not None else 0.0
+            render_elbow = elbow_deg if elbow_deg is not None else 0.0
+
+            # рендерим оба угла как повороты вокруг ОДНОЙ и той же оси - это
+            # ЧИСТО для отрисовки на экране (см. RENDER_AXIS выше), к расчёту
+            # самого угла (nutation_angle_deg) эта ось больше не имеет
+            # отношения
+            q_upper_render = axis_angle_quat(RENDER_AXIS, render_shoulder)
+            q_joint_render = axis_angle_quat(RENDER_AXIS, render_elbow)
+
+            upper_matrix = quat_to_matrix(q_upper_render)
+            joint_matrix = quat_to_matrix(q_joint_render)
 
             glPushMatrix()
             glMultMatrixf(upper_matrix)
@@ -750,13 +597,12 @@ def main():
             caption_timer += clock.get_time() / 1000.0
             if caption_timer > 0.2:
                 caption_timer = 0.0
-                if flex_deg is not None:
+                if shoulder_deg is not None:
                     pygame.display.set_caption(
-                        f"{base_caption} | flex:{flex_deg:5.1f} swing:{swing_deg:5.1f} "
-                        f"shoulder:{shoulder_deg:5.1f}"
+                        f"{base_caption} | плечо:{shoulder_deg:6.1f} локоть:{elbow_deg:6.1f}"
                     )
                 else:
-                    pygame.display.set_caption(base_caption)
+                    pygame.display.set_caption(f"{base_caption} | НЕ ОТКАЛИБРОВАНО (нажмите G)")
 
             clock.tick(60)
     finally:
