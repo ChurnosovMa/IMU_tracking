@@ -31,6 +31,7 @@
 #include "mpu6050.h"
 #include "core_cm4.h"
 #include "BNO_08x_I2C.h"
+#include "arm_pose.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,6 +58,13 @@ float roll1, pitch1, yaw1;
 float roll2, pitch2, yaw2;
 
 BNO_RotationVectorWAcc_t quat = {};
+
+/* --- калибровка/классификация положения руки (arm_pose.c), команды 'g'/'f'/'l'/'r'
+   принимаются побайтово по UART2 (тот же порт, что используется для передачи
+   данных на ПК) --- */
+static volatile uint8_t s_rx_cmd_byte = 0;
+static volatile uint8_t s_rx_cmd_pending = 0;
+static uint32_t s_tick_ms = 0;  /* грубый счётчик мс, инкрементируется в основном цикле - см. ниже */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -89,6 +97,20 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     if (GPIO_Pin == BNO_INT_Pin)
     {
         BNO_Ready = 1;
+    }
+}
+
+/* Однобайтовый асинхронный приём команд калибровки с ПК ('g','f','l','r').
+   ВАЖНО: если у вас уже ЕСТЬ обработчик HAL_UART_RxCpltCallback в проекте -
+   слейте это тело в него (линковщик не даст определить функцию дважды),
+   так же как и с HAL_GPIO_EXTI_Callback выше. */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        s_rx_cmd_pending = 1;
+        /* перезапускаем приём следующего байта */
+        HAL_UART_Receive_IT(&huart2, (uint8_t*)&s_rx_cmd_byte, 1);
     }
 }
 /* USER CODE END 0 */
@@ -163,6 +185,9 @@ int main(void)
   {
       printf("BNO: sensor not responding!\r\n");
   }
+
+  ArmPose_Init();
+  HAL_UART_Receive_IT(&huart2, (uint8_t*)&s_rx_cmd_byte, 1);  /* запускаем приём команд калибровки */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -186,12 +211,31 @@ int main(void)
 	    }
 	}
 
+	/* обработка команды калибровки, если пришла с ПК ('g'/'f'/'l'/'r') */
+	if (s_rx_cmd_pending)
+	{
+	    s_rx_cmd_pending = 0;
+	    ArmPose_HandleCommand((char)s_rx_cmd_byte);
+	}
+
+	/* грубая оценка времени в мс - HAL_GetTick() уже даёт готовый счётчик
+	   (инкрементируется системным таймером HAL, 1мс/тик по умолчанию) -
+	   используем его напрямую, s_tick_ms сохранён только для наглядности */
+	s_tick_ms = HAL_GetTick();
+
+	ArmPose_Quat q_upper = { imu1.q0, imu1.q1, imu1.q2, imu1.q3 };
+	ArmPose_Quat q_fore  = { imu2.q0, imu2.q1, imu2.q2, imu2.q3 };
+	ArmPose_Quat q_chest = { quat.Real, quat.I, quat.J, quat.K };
+	ArmPose_Update(q_upper, q_fore, q_chest, s_tick_ms);
+	uint8_t pose_number = ArmPose_GetPoseNumber();
+
     char tx[512];
     sprintf(tx,
-            "%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\r\n",
+            "%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %d\r\n",
             imu1.q0, imu1.q1, imu1.q2, imu1.q3,
             imu2.q0, imu2.q1, imu2.q2, imu2.q3,
-			quat.Real, quat.I, quat.J, quat.K
+			quat.Real, quat.I, quat.J, quat.K,
+			(int)pose_number
         );
 
     HAL_UART_Transmit(&huart2, (uint8_t*)tx, strlen(tx), HAL_MAX_DELAY);

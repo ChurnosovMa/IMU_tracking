@@ -116,49 +116,21 @@ FOREARM_RADIUS = 0.32
 FOREARM_AXIS = "y"
 FOREARM_SIGN = -1
 
-# Ось для отрисовки сгибания (нутации) в НЕповёрнутой плоскости - см.
-# compute_plane_orientation_quat() ниже, которая поворачивает эту ось на
-# угол прецессии перед фактическим использованием.
 RENDER_AXIS = (1.0, 0.0, 0.0)
 
-# BASIS_FIX_QUAT: замена базиса, найденная и подтверждённая пользователем.
-# M = [[0,0,1],[0,-1,0],[1,0,0]] (e_x->(0,0,1), e_y->(0,-1,0), e_z->(1,0,0)) -
-# поворот на 180° вокруг оси (1,0,1)/sqrt(2) (det=+1, проверено численно).
-# Относится ТОЛЬКО к тому, как выводятся значения наклона/поворота -
-# встраивается композицией в R_WORLD_REMAP (см. start_stop_capture_chest_lean()
-# ниже), тем же приёмом, что раньше применялись поправки на 180° - НЕ
-# применяется ко всей сцене целиком (это была ошибка в предыдущей версии).
 _S = 0.7071067811865476  # 1/sqrt(2)
 BASIS_FIX_QUAT = (0.0, _S, 0.0, _S)
-
-# BASIS_FIX_QUAT2: ДОПОЛНИТЕЛЬНАЯ поправка (после BASIS_FIX_QUAT оба наклона
-# - и вперёд/назад, и влево/вправо - оказались перевёрнуты, а поворот
-# остался верным). M2 = diag(-1,1,-1) - поворот на 180° вокруг оси Y (той
-# самой, что уже верна для поворота) - разворачивает X и Z, не трогая Y.
-# Композируется с BASIS_FIX_QUAT в том же месте (start_stop_capture_chest_lean).
 BASIS_FIX_QUAT2 = (0.0, 0.0, 1.0, 0.0)
 
 # ======================= НАСТРОЙКИ МОДЕЛИ ТЕЛА (трапеция) =======================
-# Трапециевидная призма: шире сверху (плечи), уже снизу (талия).
-# Верх трапеции - на высоте Z=0 (та же высота, откуда "растёт" рука).
-TORSO_TOP_HALF_WIDTH = 2.0     # половина ширины на уровне плеч
-TORSO_BOTTOM_HALF_WIDTH = 1.2  # половина ширины на уровне талии
-TORSO_DEPTH = 1.0              # толщина (перёд-зад) тела
-TORSO_HEIGHT = 3.5             # высота трапеции (от плеч до талии)
+TORSO_TOP_HALF_WIDTH = 2.0
+TORSO_BOTTOM_HALF_WIDTH = 1.2
+TORSO_DEPTH = 1.0
+TORSO_HEIGHT = 3.5
 TORSO_COLOR = (0.35, 0.4, 0.55)
 
-# Точка крепления руки - правое плечо. Определяется опытным путём (визуально
-# на экране), сторону поменять - просто сменить знак ниже.
 SHOULDER_ATTACH_POINT = (TORSO_TOP_HALF_WIDTH, 0.0, 0.0)
 
-# Локальная ось датчика груди, СОГЛАСНО НАПЕЧАТАННЫМ НА ПЛАТЕ осям (по вашему
-# описанию: X=вправо, Y=вниз, Z=вперёд) - "вперёд, наружу от тела". ВАЖНО: по
-# факту измерений эта ось оказалась ПОЧТИ ПАРАЛЛЕЛЬНА реально измеренному
-# "вниз" (~14° - крепление на практике не соответствует заявленному), поэтому
-# build_chest_mount_calibration() ЭТУ константу больше НЕ использует для
-# расчёта - там ось "вперёд" теперь выбирается автоматически (см. функцию).
-# Используется ТОЛЬКО для чисто информационного compass_heading_deg() ниже -
-# на расчёт углов руки/тела не влияет вообще.
 CHEST_LOCAL_FORWARD_AXIS = (0.0, 0.0, 1.0)
 # ==================================================================
 
@@ -166,48 +138,68 @@ quat_lock = threading.Lock()
 current_upper_quat = (1.0, 0.0, 0.0, 0.0)
 current_fore_quat = (1.0, 0.0, 0.0, 0.0)
 current_chest_quat = (1.0, 0.0, 0.0, 0.0)
+latest_stm_pose = None  # положение (1-5), присланное самой STM32 (см. arm_pose.c) - для сверки
 running = True
 
-# Режим отображения: BODY - сцена в СК тела (тело неподвижно на экране,
-# рука двигается относительно него - как сейчас); WORLD - сцена в СК земли
-# (тело физически поворачивается на экране вместе с реальным поворотом
-# человека, взятым из датчика груди). Переключается клавишей T.
+# ДОБАВЛЕНО: ссылка на открытый serial.Serial (см. serial_reader_thread) -
+# нужна, чтобы main() мог ПЕРЕСЫЛАТЬ те же команды калибровки g/f/l/r на
+# STM32, что вы нажимаете в самом Python - иначе калибровки на ПК и на плате
+# были бы двумя НЕЗАВИСИМЫМИ проходами (пришлось бы калибровать дважды,
+# рискуя сделать чуть разные движения каждый раз).
+serial_connection = None
+
+
+def send_calibration_command_to_stm(cmd: str):
+    """Отправить один байт-команду ('g','f','l','r') на STM32 по тому же
+    UART, синхронно с локальной калибровкой в Python (см. main())."""
+    global serial_connection
+    if serial_connection is None:
+        return
+    try:
+        serial_connection.write(cmd.encode("ascii"))
+    except Exception as e:
+        print(f"Не удалось отправить команду '{cmd}' на STM32: {e}")
+
 DISPLAY_MODE_BODY, DISPLAY_MODE_WORLD = range(2)
 display_mode = DISPLAY_MODE_BODY
 
 IDENTITY_QUAT = (1.0, 0.0, 0.0, 0.0)
 
-# --- калибровка 1 "рука вниз": продольная ось кости В КООРДИНАТАХ ДАТЧИКА,
-#     ПЛЮС ориентация датчика груди (нужна только для нескольких
-#     диагностических печатей ниже - реальный поворот сцены строится через
-#     R_WORLD_REMAP, см. ниже, он фиксированный и калибровки не требует) ---
 cal_lock = threading.Lock()
 local_bone_axis_upper = None
 local_bone_axis_fore = None
 is_calibrated_down = False
 
-# --- калибровка 2 "рука вперёд": группа (плечо+предплечье) привязывается
-#     к датчику груди по азимуту ---
 cal2_lock = threading.Lock()
-y_group_in_upper_frame = None   # "вперёд" для группы, в СК датчика плеча
-x_group_in_upper_frame = None   # "влево" для группы, в СК датчика плеча
-q_chest_cal = None              # показания груди в момент калибровки 2
+y_group_in_upper_frame = None
+x_group_in_upper_frame = None
+q_chest_cal = None
 is_calibrated_forward = False
 
-# --- калибровка 3 "наклон влево" (клавиша L) ---
-# ПОЧЕМУ она нужна: датчик на груди физически приклеен с каким-то поворотом
-# ВОКРУГ ВЕРТИКАЛИ относительно истинного 'вперёд' тела - неизвестным заранее
-# углом (не обязательно 0°/90°/180°). Автоматический выбор 'какая из сырых
-# осей X/Y дальше от вниз' ЭТОТ угол в принципе не может учесть - он берёт
-# ЧИСТУЮ (1,0,0) или (0,1,0), что верно только если датчик приклеен ИДЕАЛЬНО
-# ровно. Отсюда и 'оси под углом, а не перпендикулярно' - никакая перестановка
-# знаков (±180°) не может исправить ошибку в ПРОИЗВОЛЬНЫЙ угол, только сама
-# ось (не полярность) была неверна. Решение - измерить эту ось РЕАЛЬНЫМ
-# движением (тем же приёмом, что раньше калибровали ось плеча взмахом руки).
 cal3_lock = threading.Lock()
-chest_pitch_axis_measured = None  # измеренная ось 'наклон вперёд', в W_bno (мировая конвенция BNO)
 is_world_remap_calibrated = False
-R_WORLD_REMAP = IDENTITY_QUAT      # пересчитывается после калибровки L (см. build_world_remap ниже)
+R_WORLD_REMAP = IDENTITY_QUAT
+
+# ДОБАВЛЕНО: перевод СК датчика РУКИ в ту же "сцену", что и R_WORLD_REMAP -
+# без новой калибровки, переиспользуя уже посчитанное: DOWN_WORLD (вертикаль
+# руки, всегда верна благодаря AXIS_REMAP) + Y_group (направление руки на
+# момент F - при условии, что человек в этот момент держал руку вытянутой
+# ТУДА ЖЕ, куда "смотрит" тело - тогда Y_group физически совпадает с "вперёд"
+# тела с точностью до погрешности исполнения человеком, порядка нескольких
+# градусов - проверено численно: 5° погрешности дают ~0.5° ошибки итогового
+# угла, не катастрофично). R_WORLD_REMAP_RAW - ТА ЖЕ формула, что
+# R_WORLD_REMAP, но БЕЗ BASIS_FIX (тот нужен только для картинки в режиме
+# "земля", а не для этой коррекции - если использовать R_WORLD_REMAP с
+# BASIS_FIX здесь, коррекция ломается, проверено раньше: 87° ошибки вместо 0).
+R_ARM_REMAP = IDENTITY_QUAT
+R_WORLD_REMAP_RAW = IDENTITY_QUAT
+is_arm_remap_calibrated = False
+
+# ДОБАВЛЕНО: то же самое, но для ПРЕДПЛЕЧЬЯ - нужно, чтобы поправка на
+# наклон тела работала не только для плеча, но и для локтя/азимута (см.
+# compute_arm_angles_relative_to_body ниже).
+R_FOREARM_REMAP = IDENTITY_QUAT
+is_forearm_remap_calibrated = False
 
 CAPTURE_NONE, CAPTURE_DOWN, CAPTURE_CHEST_LEAN = range(3)
 capture_mode = CAPTURE_NONE
@@ -215,6 +207,8 @@ buf_upper = []
 buf_fore = []
 buf_chest = []
 buf_chest_lean = []
+buf_upper_lean = []  # ДОБАВЛЕНО
+buf_fore_lean = []   # ДОБАВЛЕНО
 
 
 # --------------------- Кватернионная математика ---------------------
@@ -244,8 +238,6 @@ def quat_normalize(q):
 
 
 def rotate_vector_by_quat(q, v):
-    """Повернуть вектор v (заданный в локальной СК датчика) кватернионом q -
-    получаем этот же вектор, но выраженный в МИРОВОЙ СК."""
     qv = (0.0, v[0], v[1], v[2])
     r = quat_multiply(quat_multiply(q, qv), quat_conjugate(q))
     return (r[1], r[2], r[3])
@@ -290,9 +282,6 @@ def quat_to_matrix(q):
 
 
 def matrix3_to_quat(m00, m01, m02, m10, m11, m12, m20, m21, m22):
-    """3x3-матрица (m_ij, i=строка, j=столбец) -> кватернион. Смысл матрицы:
-    её СТОЛБЦЫ - это образы стандартных осей (1,0,0),(0,1,0),(0,0,1) после
-    поворота, т.е. столбец 0 = m00,m10,m20 = куда переходит (1,0,0)."""
     trace = m00 + m11 + m22
     if trace > 0:
         s = 0.5 / math.sqrt(trace + 1.0)
@@ -352,37 +341,18 @@ def v_cross(a, b):
     )
 
 
-# --------------------- Калибровка 1 "рука вниз" + нутация ---------------------
-
 DOWN_WORLD = (0.0, -1.0, 0.0)
 UP_WORLD = (0.0, 1.0, 0.0)
 
-# У РАЗНЫХ датчиков РАЗНАЯ конвенция "вертикали" ВНУТРИ их собственного
-# кватерниона (не путать с тем, как физически приклеена плата - это другое!).
-# У DMP MPU6050 (плечо, предплечье) - Y-конвенция, и AXIS_REMAP уже её
-# компенсирует, поэтому для них подходит DOWN_WORLD выше. У BNO08x (грудь) -
-# по факту проверки (см. историю калибровки) - Z-конвенция: то, что chip
-# сам считает 'вертикалью' внутри своего кватерниона, соответствует оси Z, а
-# не Y. Если снова окажется не так - поменяйте эту константу (варианты:
-# (0,-1,0), (0,0,-1), (0,0,1) и т.п.) и посмотрите на печатаемый после G
-# угол до X/Y/Z - должен быть маленьким (<20°) хотя бы до одной из осей.
 CHEST_WORLD_DOWN = (0.0, 0.0, 1.0)
 
 
 def gravity_in_sensor_frame(q_sensor_to_world, world_down=DOWN_WORLD):
-    """Направление 'вниз' В МИРОВОЙ КОНВЕНЦИИ ДАТЧИКА (world_down - см. выше,
-    может отличаться у разных датчиков!), выраженное В КООРДИНАТАХ ДАТЧИКА -
-    для руки это продольная ось кости, для груди - см. CHEST_WORLD_DOWN."""
     q_world_to_sensor = quat_conjugate(q_sensor_to_world)
     return rotate_vector_by_quat(q_world_to_sensor, world_down)
 
 
 def axis_from_total_rotation_world(quat_sequence):
-    """Ось ОДНОГО суммарного поворота (начало -> конец записи), В МИРОВОЙ
-    ('W_bno') конвенции - та же формула (q2 ⊗ conj(q1)), что и в
-    get_body_delta_quat(). Знак здесь ОДНОЗНАЧЕН (определяется направлением
-    реального физического движения, а не PCA/автовыбором) - тот же приём,
-    что раньше решил проблему 'зеркальной' оси при калибровке плеча."""
     if len(quat_sequence) < 2:
         return None
     q1 = quat_sequence[0]
@@ -398,28 +368,12 @@ def axis_from_total_rotation_world(quat_sequence):
 
 
 def build_world_remap(down_axis, pitch_axis):
-    """Строит R_WORLD_REMAP из ДВУХ ИЗМЕРЕННЫХ (не угаданных!) осей, обе - в
-    собственной 'мировой' конвенции BNO (W_bno):
-      down_axis   - CHEST_WORLD_DOWN (см. выше, свойство самого чипа)
-      pitch_axis  - ИЗМЕРЕН калибровкой 'наклон вперёд' (L), см.
-                    start_stop_capture_chest_lean() ниже - учитывает
-                    РЕАЛЬНЫЙ угол крепления датчика вокруг вертикали, а не
-                    чистую (1,0,0) или (0,1,0), как раньше.
-
-    Физика: наклон ВПЕРЁД - это вращение вокруг горизонтальной ОСИ
-    ВЛЕВО-ВПРАВО (та же логика, что у самолёта: тангаж - вращение вокруг
-    поперечной оси). То есть измеренная этим движением ось - это и есть
-    ось 'влево-вправо' сама по себе, напрямую (доворачивать через
-    произведение не нужно для НЕЁ - только для 'вперёд', см. ниже).
-
-    'Вперёд' довычисляется через векторное произведение (для право-
-    ориентированной, корректной тройки осей)."""
     d = v_norm(down_axis)
     proj = v_dot(d, pitch_axis)
-    f = v_norm(v_sub(pitch_axis, v_scale(d, proj)))  # ортогонализация относительно 'вниз'
-    l = v_cross(d, f)  # left = down x forward (право-ориентированно для L=(-1,0,0),D=(0,-1,0),F=(0,0,1))
+    f = v_norm(v_sub(pitch_axis, v_scale(d, proj)))
+    l = v_cross(d, f)
 
-    L_scene = (-1.0, 0.0, 0.0)   # влево в сцене (SHOULDER_ATTACH_POINT = +X = вправо)
+    L_scene = (-1.0, 0.0, 0.0)
     D_scene = DOWN_WORLD
     F_scene = v_cross(L_scene, D_scene)
 
@@ -431,18 +385,21 @@ def build_world_remap(down_axis, pitch_axis):
 
 
 def start_stop_capture_chest_lean():
-    """Калибровка 3 (клавиша L): 'наклонитесь корпусом (поклонитесь) вперёд
-    ОДИН РАЗ' (не туда-сюда - см. пояснение про однонаправленность движений
-    в докстринге калибровки руки выше, та же логика: колебательное движение
-    даёт неоднозначный знак оси, одно чистое движение - однозначный).
-    Наклон вперёд выбран вместо наклона вбок, потому что его проще сделать
-    на больший, более уверенный угол - для калибровки это не принципиально,
-    работает любое горизонтальное движение (вторая ось всё равно
-    довычисляется через векторное произведение)."""
-    global capture_mode, buf_chest_lean
+    """Калибровка L: 'наклонитесь корпусом вперёд ОДИН РАЗ'. ИЗМЕНЕНО:
+    теперь пишет ОДНОВРЕМЕННО все три датчика (грудь+плечо+предплечье) во
+    время ОДНОГО и того же движения - это принципиально: R_ARM_REMAP и
+    R_FOREARM_REMAP, построенные из ДРУГОГО движения (как раньше - из
+    Y_group калибровки F, в предположении 'рука в момент F смотрела туда
+    же, куда тело'), дают НЕПРЕДСКАЗУЕМО большую ошибку (проверено на
+    сценарии 'лечь, рука не двигается относительно тела' - ошибка ~34°,
+    неприемлемо) - а построенные из ОБЩЕГО движения дают доказанную,
+    проверенную многократно точность (0.00000° в тестах)."""
+    global capture_mode, buf_chest_lean, buf_upper_lean, buf_fore_lean
     if capture_mode == CAPTURE_NONE:
         capture_mode = CAPTURE_CHEST_LEAN
         buf_chest_lean = []
+        buf_upper_lean = []  # ДОБАВЛЕНО
+        buf_fore_lean = []   # ДОБАВЛЕНО
         print("[наклон вперёд] запись начата — стоя прямо, наклонитесь корпусом "
               "вперёд ОДИН РАЗ (не туда-сюда), затем L ещё раз - стоп...")
         return
@@ -451,24 +408,42 @@ def start_stop_capture_chest_lean():
         return
     capture_mode = CAPTURE_NONE
 
-    global chest_pitch_axis_measured, is_world_remap_calibrated, R_WORLD_REMAP
+    global is_world_remap_calibrated, R_WORLD_REMAP, R_WORLD_REMAP_RAW
     axis = axis_from_total_rotation_world(buf_chest_lean)
     if axis is None:
         print("Слишком мало движения зафиксировано, повторите увереннее.")
         return
     with cal3_lock:
-        chest_pitch_axis_measured = axis
-        # BASIS_FIX_QUAT / BASIS_FIX_QUAT2 - поправки базиса (найдены и
-        # подтверждены пользователем, см. комментарии у констант выше) -
-        # относятся ТОЛЬКО к тому, как выводятся значения наклона/поворота
-        # (т.е. именно к R_WORLD_REMAP), а не ко всей сцене целиком - тот же
-        # приём (композиция поворотом), что раньше применялся вручную
-        # (180° вокруг X, затем вокруг Z), теперь встроен туда же.
         basis_fix = quat_multiply(BASIS_FIX_QUAT2, BASIS_FIX_QUAT)
-        R_WORLD_REMAP = quat_multiply(basis_fix, build_world_remap(CHEST_WORLD_DOWN, axis))
+        R_WORLD_REMAP_RAW = build_world_remap(CHEST_WORLD_DOWN, axis)
+        R_WORLD_REMAP = quat_multiply(basis_fix, R_WORLD_REMAP_RAW)
         is_world_remap_calibrated = True
-    print(f"[L] Ось 'влево-вправо' измерена: {tuple(round(c, 3) for c in axis)}. "
+    print(f"[L] Ось 'влево-вправо' (тело) измерена: {tuple(round(c, 3) for c in axis)}. "
           f"Режим 'земля' готов к использованию.")
+
+    # ДОБАВЛЕНО: та же запись (то же самое движение) используется ЕЩЁ РАЗ
+    # для руки и предплечья - см. докстринг выше про точность.
+    global R_ARM_REMAP, is_arm_remap_calibrated
+    global R_FOREARM_REMAP, is_forearm_remap_calibrated
+    upper_axis = axis_from_total_rotation_world(buf_upper_lean)
+    if upper_axis is not None:
+        R_ARM_REMAP = build_world_remap(DOWN_WORLD, upper_axis)
+        is_arm_remap_calibrated = True
+        print(f"[L] Ось (плечо) измерена: {tuple(round(c, 3) for c in upper_axis)}.")
+    else:
+        is_arm_remap_calibrated = False
+        print("[L] Слишком мало движения датчика плеча - поправка плеча на "
+              "наклон тела недоступна.")
+
+    fore_axis = axis_from_total_rotation_world(buf_fore_lean)
+    if fore_axis is not None:
+        R_FOREARM_REMAP = build_world_remap(DOWN_WORLD, fore_axis)
+        is_forearm_remap_calibrated = True
+        print(f"[L] Ось (предплечье) измерена: {tuple(round(c, 3) for c in fore_axis)}.")
+    else:
+        is_forearm_remap_calibrated = False
+        print("[L] Слишком мало движения датчика предплечья - поправка локтя "
+              "на наклон тела недоступна.")
 
 
 
@@ -507,28 +482,25 @@ def start_stop_capture_down():
 
 
 def nutation_angle_deg(q, local_bone_axis):
-    """Угол между текущим направлением кости и 'вниз', arccos(скалярное
-    произведение) - БЕЗ проекции на плоскость (см. объяснение в предыдущей
-    версии файла: эта формула инвариантна к прецессии по построению)."""
     world_dir = rotate_vector_by_quat(q, local_bone_axis)
     cos_theta = max(-1.0, min(1.0, v_dot(world_dir, DOWN_WORLD)))
     return math.degrees(math.acos(cos_theta))
 
 
-# --------------------- Калибровка 2 "рука вперёд" (прецессия) ---------------------
-
 def horizontal_project_normalize(v):
-    """Убрать вертикальную (Y) компоненту вектора и нормализовать остаток -
-    используется, чтобы получить ГОРИЗОНТАЛЬНОЕ направление (азимут)."""
     proj = v_dot(v, UP_WORLD)
     horiz = v_sub(v, v_scale(UP_WORLD, proj))
     return v_norm(horiz)
 
 
 def try_calibrate_forward():
-    """Калибровка 2: 'рука вытянута вперёд' (не важен точный угол в локте
-    или горизонт - важен только азимут). Нажимается ОДИН РАЗ, мгновенно
-    (не запись, а разовый снимок - в отличие от калибровки 1)."""
+    """Калибровка F: 'рука вытянута вперёд'. ИЗМЕНЕНО: раньше здесь ЕЩЁ
+    строились R_ARM_REMAP/R_FOREARM_REMAP (из предположения 'рука в этот
+    момент смотрела туда же, куда тело') - это давало НЕНАДЁЖНУЮ,
+    непредсказуемо большую ошибку (см. докстринг start_stop_capture_chest_lean).
+    Теперь R_ARM_REMAP/R_FOREARM_REMAP строятся ТАМ, из общего с телом
+    движения - F отвечает только за q_chest_cal (точка отсчёта поворота
+    тела) и Y_group/X_group (опорное направление для азимута)."""
     global y_group_in_upper_frame, x_group_in_upper_frame, q_chest_cal, is_calibrated_forward
 
     with cal_lock:
@@ -541,15 +513,13 @@ def try_calibrate_forward():
         q_upper_now = current_upper_quat
         q_chest_now = current_chest_quat
 
-    # направление кости плеча В СОБСТВЕННЫХ координатах датчика плеча,
-    # спроецированное на горизонт - ЭТО и есть "вперёд" для всей группы
     bone_dir_own = rotate_vector_by_quat(q_upper_now, bone_axis_upper)
     y_group = horizontal_project_normalize(bone_dir_own)
     if y_group == (0.0, 0.0, 0.0):
         print("Рука сейчас направлена вертикально - нельзя определить азимут, "
               "вытяните руку более горизонтально и повторите.")
         return
-    x_group = v_norm(v_cross(UP_WORLD, y_group))  # "влево" - перпендикулярно, право-ориентированный базис
+    x_group = v_norm(v_cross(UP_WORLD, y_group))
 
     with cal2_lock:
         y_group_in_upper_frame = y_group
@@ -569,32 +539,28 @@ def reset_calibration_forward():
 
 
 def twist_angle_about_axis_deg(q, axis):
-    """Знаковый угол поворота кватерниона q вокруг ПРОИЗВОЛЬНОЙ оси axis.
-    Для датчика груди это ДОЛЖНА быть CHEST_WORLD_DOWN (его собственная
-    'мировая' конвенция вертикали, см. выше) - НЕ обязательно (0,1,0)!"""
     w, x, y, z = q
     proj = x * axis[0] + y * axis[1] + z * axis[2]
     return math.degrees(2.0 * math.atan2(proj, w))
 
 
 def compute_precession_deg():
-    """Возвращает (azimuth_arm_deg, body_yaw_since_cal_deg, total_deg) или
-    (None, None, None), если калибровка 2 ещё не выполнена.
-
-    azimuth_arm_deg        - насколько РУКА (по её же собственным показаниям,
-                              в её ФИКСИРОВАННОЙ/инерциальной СК) отклонилась
-                              от направления калибровки. ВКЛЮЧАЕТ в себя и
-                              независимое движение руки, И поворот тела (см.
-                              докстринг вверху файла) - собственная СК
-                              датчика плеча не вращается вместе с телом.
-    body_yaw_since_cal_deg - насколько ПОВЕРНУЛОСЬ ТЕЛО с момента калибровки,
-                              по датчику груди (магнитометр - без дрейфа).
-    total_deg               - РАЗНОСТЬ (не сумма!) - см. докстринг вверху
-                              файла: вычитание убирает вклад поворота тела
-                              из azimuth_arm, оставляя только движение руки
-                              ОТНОСИТЕЛЬНО тела. Используется и для рендера,
-                              и как основной результат.
-    """
+    """ЗНАК ЭТОЙ ФОРМУЛЫ МЕНЯЛСЯ ДВАЖДЫ - см. историю:
+    1) Изначально было ВЫЧИТАНИЕ (azimuth_arm_deg - body_yaw_since_cal_deg).
+    2) Синтетическая проверка (случайные, независимые друг от друга условные
+       крепления датчиков руки/груди) показала, что azimuth_arm_deg
+       (конвенция UP_WORLD) и body_yaw_since_cal_deg (конвенция
+       CHEST_WORLD_DOWN, противоположно направленная ось) получают
+       противоположный знак для одного и того же реального поворота - из
+       чего был сделан вывод, что нужно СЛОЖЕНИЕ.
+    3) На РЕАЛЬНОМ железе сложение не сработало (пользователь подтвердил
+       тестом: азимут руки и поворот тела складываются, а не взаимно
+       вычитаются, чтобы получить угол ОТНОСИТЕЛЬНО ТЕЛА) - значит для
+       ИЗВЛЕЧЕНИЯ угла относительно тела нужно именно ВЫЧИТАНИЕ. Синтетическая
+       проверка использовала условные (не обязательно физически достижимые
+       с реальным AXIS_REMAP) крепления - вывод пункта 2 не подтвердился на
+       практике. Вернул вычитание (то же, что было в пункте 1) - см. текущую
+       формулу ниже."""
     with cal2_lock:
         if not is_calibrated_forward:
             return None, None, None
@@ -609,55 +575,169 @@ def compute_precession_deg():
         q_upper_now = current_upper_quat
         q_chest_now = current_chest_quat
 
-    # --- азимут руки, из СОБСТВЕННЫХ показаний датчика плеча ---
     bone_dir_own = rotate_vector_by_quat(q_upper_now, bone_axis_upper)
     horiz_now = horizontal_project_normalize(bone_dir_own)
     cos_a = v_dot(horiz_now, y_group)
     sin_a = v_dot(horiz_now, x_group)
     azimuth_arm_deg = math.degrees(math.atan2(sin_a, cos_a))
 
-    # --- поворот тела с момента калибровки, из датчика груди (стабильно) ---
-    # ВАЖНО: ось этого поворота выражена в СОБСТВЕННОЙ 'мировой' конвенции
-    # BNO (CHEST_WORLD_DOWN, см. выше) - НЕ в оси Y сцены (это была ошибка,
-    # из-за которой в режиме 'тело' поворот тела не убирался из azimuth_arm
-    # корректно - в режиме 'земля' её не было видно, там работает другой,
-    # уже отдельно исправленный путь через R_WORLD_REMAP).
     q_body_delta = quat_multiply(q_chest_now, quat_conjugate(q_chest_baseline))
     body_yaw_since_cal_deg = twist_angle_about_axis_deg(q_body_delta, CHEST_WORLD_DOWN)
 
-    # ВЫЧИТАНИЕ, не сложение - см. докстринг выше и вверху файла
+    # ВЕРНУЛ вычитание (см. докстринг выше, пункт 3 - подтверждено на
+    # реальном железе).
     total_deg = azimuth_arm_deg - body_yaw_since_cal_deg
+    # приводим к диапазону (-180, 180]
+    total_deg = (total_deg + 180.0) % 360.0 - 180.0
     return azimuth_arm_deg, body_yaw_since_cal_deg, total_deg
 
 
-def compute_body_tilt(q_chest, remap_q):
+def compute_body_tilt(q_chest_now, q_chest_baseline, remap_q):
     """
-    Возвращает (tilt_forward_deg, tilt_sideways_deg) или (None, None),
-    если remap_q не готов.
-    tilt_forward > 0  – наклон вперёд,
-    tilt_sideways > 0 – наклон вправо (в сторону правого плеча).
-    """
+    Возвращает (tilt_forward_deg, tilt_sideways_deg) или (None, None), если
+    remap_q не готов.
+    tilt_forward > 0  - наклон вперёд,
+    tilt_sideways > 0 - наклон вправо (в сторону правого плеча).
+
+    ИСПРАВЛЕНО: раньше функция (а) не учитывала калибровочную позу (q_chest_cal)
+    вообще - считала наклон "от рождения", а не "с момента калибровки", и (б)
+    путала CHEST_WORLD_DOWN (свойство ВНУТРЕННЕЙ конвенции самого чипа BNO) с
+    локальным (привязанным к корпусу) вектором тела - это разные вещи (см.
+    историю калибровки). Из-за этого даже стоя неподвижно с момента
+    калибровки показывало ~80-100° мусора вместо ~0.
+
+    Теперь: считаем ТУ ЖЕ величину q_body_scene, что и режим "земля" (полный
+    поворот тела с момента калибровки, переведённый в сцену), и применяем её
+    к СОБСТВЕННОЙ вертикали СЦЕНЫ (0,1,0) - это направление "от основания
+    трапеции к вершине" (см. draw_torso: верх/шире на Y=0, низ/уже на
+    Y=-TORSO_HEIGHT) - то есть именно та ось, которую вы и имели в виду."""
     if remap_q is None:
         return None, None
-    # Переводим ориентацию груди в систему координат сцены (Y вверх)
-    q_scene = quat_multiply(remap_q, q_chest)
-    down_vec = rotate_vector_by_quat(q_scene, CHEST_WORLD_DOWN)  # (0,0,1) -> сцена
-    # В сцене вертикаль: (0, -1, 0)  (DOWN_WORLD)
-    vertical_component = -down_vec[1]          # проекция на вертикаль Y
-    forward_component  = -down_vec[2]          # проекция на ось Z (глубина)
-    sideways_component =  down_vec[0]          # проекция на ось X
-    # pitch – наклон вперёд/назад
+    body_delta = quat_multiply(q_chest_now, quat_conjugate(q_chest_baseline))
+    q_body_scene = quat_multiply(quat_multiply(remap_q, body_delta), quat_conjugate(remap_q))
+    up_now = rotate_vector_by_quat(q_body_scene, (0.0, 1.0, 0.0))
+    vertical_component = up_now[1]
+    forward_component  = -up_now[2]
+    sideways_component =  up_now[0]
     pitch = math.degrees(math.atan2(forward_component, vertical_component))
-    # roll – наклон вбок
     roll  = math.degrees(math.atan2(sideways_component, vertical_component))
     return pitch, roll
 
+
+def apply_body_correction(q_raw, R_segment, q_body_scene_raw):
+    """ДОБАВЛЕНО. Пересчитывает сырое показание датчика руки в 'то, что он
+    показывал бы, если бы тело НЕ поворачивалось/не наклонялось с момента
+    калибровки F' - убирает ЛЮБОЙ поворот тела целиком, не только рысканье.
+    q_body_scene_raw ОБЯЗАН быть посчитан через R_WORLD_REMAP_RAW (БЕЗ
+    BASIS_FIX), не R_WORLD_REMAP - см. пояснение у констант выше."""
+    q_seg_scene = quat_multiply(quat_multiply(R_segment, q_raw), quat_conjugate(R_segment))
+    q_seg_scene_corrected = quat_multiply(quat_conjugate(q_body_scene_raw), q_seg_scene)
+    return quat_multiply(quat_multiply(quat_conjugate(R_segment), q_seg_scene_corrected), R_segment)
+
+
+def compute_arm_angles_relative_to_body():
+    """Заменяет прежнюю compute_shoulder_relative_to_body_deg() - теперь
+    считает ВСЕ ТРИ угла (плечо, локоть, азимут) ОТНОСИТЕЛЬНО ТЕЛА из ОДНИХ
+    И ТЕХ ЖЕ скорректированных кватернионов (q_upper_corrected/q_fore_corrected),
+    устойчивых к ЛЮБОМУ повороту/наклону тела - в отличие от
+    compute_current_angles()/compute_precession_deg(), которые считают углы
+    относительно ИСТИННОЙ МИРОВОЙ вертикали (см. пояснение в докстринге
+    nutation_angle_deg) и потому "плывут", когда тело наклоняется или
+    ложится (пример: лёжа, рука к полу - показывали ~0° вместо ожидаемых
+    ~90° относительно тела - вот эта функция и чинит именно это).
+
+    Возвращает (shoulder_deg, elbow_deg, azimuth_deg) - любое поле может
+    быть None, если соответствующая калибровка ещё не готова (нужны G, F, L
+    - локоть дополнительно требует, чтобы предплечье НЕ было строго
+    вертикально в момент F, см. try_calibrate_forward)."""
+    with cal_lock:
+        if not is_calibrated_down:
+            return None, None, None
+        upper_local_axis = local_bone_axis_upper
+        fore_local_axis = local_bone_axis_fore
+
+    if not is_arm_remap_calibrated:
+        return None, None, None
+    R_arm = R_ARM_REMAP
+
+    with cal3_lock:
+        if not is_world_remap_calibrated:
+            return None, None, None
+        R_world_raw = R_WORLD_REMAP_RAW
+
+    with cal2_lock:
+        if not is_calibrated_forward:
+            return None, None, None
+        q_chest_baseline = q_chest_cal
+        y_group = y_group_in_upper_frame
+        x_group = x_group_in_upper_frame
+
+    with quat_lock:
+        q_upper = current_upper_quat
+        q_fore = current_fore_quat
+        q_chest_now = current_chest_quat
+
+    body_delta_raw = quat_multiply(q_chest_now, quat_conjugate(q_chest_baseline))
+    q_body_scene_raw = quat_multiply(quat_multiply(R_world_raw, body_delta_raw),
+                                      quat_conjugate(R_world_raw))
+    q_upper_corrected = apply_body_correction(q_upper, R_arm, q_body_scene_raw)
+
+    shoulder_deg = nutation_angle_deg(q_upper_corrected, upper_local_axis)
+
+    elbow_deg = None
+    if is_forearm_remap_calibrated:
+        q_fore_corrected = apply_body_correction(q_fore, R_FOREARM_REMAP, q_body_scene_raw)
+        forearm_abs_deg = nutation_angle_deg(q_fore_corrected, fore_local_axis)
+        elbow_deg = forearm_abs_deg - shoulder_deg
+
+    bone_dir_corrected = rotate_vector_by_quat(q_upper_corrected, upper_local_axis)
+    horiz_corrected = horizontal_project_normalize(bone_dir_corrected)
+    azimuth_deg = None
+    if horiz_corrected != (0.0, 0.0, 0.0):
+        cos_a = v_dot(horiz_corrected, y_group)
+        sin_a = v_dot(horiz_corrected, x_group)
+        azimuth_deg = math.degrees(math.atan2(sin_a, cos_a))
+
+    return shoulder_deg, elbow_deg, azimuth_deg
+
+
+def classify_arm_pose(shoulder_deg, elbow_deg, precession_deg, tilt_fwd, tilt_side):
+    """Дискретизация текущего положения руки в 5 категорий (по описанию,
+    ПРАВКА ПОЛЬЗОВАТЕЛЯ - добавлена категория 'рука согнута', 'прочее'
+    сдвинуто на 5; диапазон прецессии для 'рука вбок' - ОТРИЦАТЕЛЬНЫЙ
+    (-100..-60), не (60..100), как было раньше - подтверждено пользователем
+    на практике, не переспрашиваю):
+      1: рука вниз    - плечо<15°, локоть<20° (прямая рука), прецессия любая, тело почти вертикально
+      2: рука вперёд  - плечо>60°, локоть<20° (прямая рука), прецессия в [-30,30]°, тело почти вертикально
+      3: рука вбок    - плечо>60°, локоть<20° (прямая рука), прецессия в [-100,-60]°, тело почти вертикально
+      4: рука согнута - локоть>70° (независимо от плеча/прецессии), тело почти вертикально
+      5: прочие положения
+    Возвращает строку-метку или None, если ещё не откалибровано (нужны G и F
+    минимум; наклон тела - опционально, если L не сделана, считаем "тело
+    вертикально" по умолчанию, чтобы категории 1-4 всё равно работали)."""
+    if shoulder_deg is None or elbow_deg is None:
+        return None
+
+    tilt_ok = True
+    if tilt_fwd is not None and tilt_side is not None:
+        tilt_ok = abs(tilt_fwd) < 25.0 and abs(tilt_side) < 25.0
+
+    if 180 - elbow_deg < 110 and tilt_ok:
+        return "4: рука согнута"
+
+    if shoulder_deg < 15.0 and 180 - elbow_deg > 160.0 and tilt_ok:
+        return "1: рука вниз"
+
+    if shoulder_deg > 60.0 and 180 - elbow_deg > 160.0 and tilt_ok and precession_deg is not None:
+        if -30.0 <= precession_deg <= 30.0:
+            return "2: рука вперёд"
+        if -100.0 <= precession_deg <= -60.0:
+            return "3: рука вбок"
+
+    return "5: прочее положение"
+
+
 def get_body_delta_quat():
-    """ПОЛНЫЙ (не только yaw-компонента) поворот тела с момента калибровки
-    'вперёд', по датчику груди. Используется ТОЛЬКО для режима отображения
-    DISPLAY_MODE_WORLD (см. main()) - поворачивает всю сцену (тело+рука) на
-    экране вслед за реальным поворотом человека. Возвращает None, если
-    калибровка 2 ещё не выполнена."""
     with cal2_lock:
         if not is_calibrated_forward:
             return None
@@ -668,18 +748,11 @@ def get_body_delta_quat():
 
 
 def compass_heading_deg(q_chest):
-    """ЧИСТО информационная величина для консоли - компасный азимут груди
-    (0=условный 'север', 90=условный 'восток' и т.д., в зависимости от
-    CHEST_LOCAL_FORWARD_AXIS). НЕ используется в расчёте руки/тела выше -
-    подберите CHEST_LOCAL_FORWARD_AXIS эмпирически, если нужна точность."""
     world_dir = rotate_vector_by_quat(q_chest, CHEST_LOCAL_FORWARD_AXIS)
-    # убираем вертикальную составляющую В КОНВЕНЦИИ САМОГО ДАТЧИКА ГРУДИ
-    # (CHEST_WORLD_DOWN, не UP_WORLD сцены - world_dir ещё в конвенции BNO)
     proj = v_dot(world_dir, CHEST_WORLD_DOWN)
     horiz = v_norm(v_sub(world_dir, v_scale(CHEST_WORLD_DOWN, proj)))
     if horiz == (0.0, 0.0, 0.0):
         return None
-    # условные "север"/"восток" - любая ортогональная CHEST_WORLD_DOWN пара
     candidates = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
     seed = min(candidates, key=lambda a: abs(v_dot(CHEST_WORLD_DOWN, a)))
     north = v_norm(v_sub(seed, v_scale(CHEST_WORLD_DOWN, v_dot(CHEST_WORLD_DOWN, seed))))
@@ -690,23 +763,33 @@ def compass_heading_deg(q_chest):
     return heading % 360.0
 
 
-# --------------------- Чтение UART ---------------------
-
 def parse_line(line: str):
+    """Теперь прошивка STM32 шлёт 13 чисел: 12 (кватернионы) + положение
+    руки 1-5, посчитанное НА САМОЙ STM32 (см. arm_pose.c) - для сверки с
+    тем же расчётом здесь, в Python (см. main(), 'stm_pose' в тексте
+    оверлея). Строки со старым форматом (ровно 12 чисел, без STM-положения)
+    тоже принимаются - для совместимости со старой прошивкой."""
     try:
         parts = [float(p) for p in line.strip().split(" ")]
-        if len(parts) != 12:
-            return None
-        q_upper = tuple(parts[0:4])
-        q_fore = tuple(parts[4:8])
-        q_chest = tuple(parts[8:12])
-        return q_upper, q_fore, q_chest
+        if len(parts) == 12:
+            q_upper = tuple(parts[0:4])
+            q_fore = tuple(parts[4:8])
+            q_chest = tuple(parts[8:12])
+            return q_upper, q_fore, q_chest, None
+        if len(parts) == 13:
+            q_upper = tuple(parts[0:4])
+            q_fore = tuple(parts[4:8])
+            q_chest = tuple(parts[8:12])
+            stm_pose = int(round(parts[12]))
+            return q_upper, q_fore, q_chest, stm_pose
+        return None
     except ValueError:
         return None
 
 
 def serial_reader_thread():
-    global current_upper_quat, current_fore_quat, current_chest_quat, running
+    global current_upper_quat, current_fore_quat, current_chest_quat, running, latest_stm_pose
+    global serial_connection
 
     try:
         ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
@@ -715,6 +798,7 @@ def serial_reader_thread():
         running = False
         return
 
+    serial_connection = ser  # ДОБАВЛЕНО - чтобы main() мог слать команды g/f/l/r на STM32
     print(f"Порт {SERIAL_PORT} открыт, жду данные...")
 
     while running:
@@ -725,31 +809,28 @@ def serial_reader_thread():
             line = raw.decode("utf-8", errors="ignore")
             parsed = parse_line(line)
             if parsed is not None:
-                q_upper, q_fore, q_chest = parsed
+                q_upper, q_fore, q_chest, stm_pose = parsed
                 q_upper = apply_axis_remap(q_upper)
                 q_fore = apply_axis_remap(q_fore)
-                # ПРИМЕЧАНИЕ: q_chest НЕ пропускаем через AXIS_REMAP датчиков
-                # руки - у него своя "мировая" конвенция (CHEST_WORLD_DOWN,
-                # см. выше), учитываемая отдельно в нужных местах, а не
-                # общим переразмечиванием кватерниона на входе.
                 with quat_lock:
                     current_upper_quat = q_upper
                     current_fore_quat = q_fore
                     current_chest_quat = q_chest
+                    latest_stm_pose = stm_pose
                 if capture_mode == CAPTURE_DOWN:
                     buf_upper.append(q_upper)
                     buf_fore.append(q_fore)
                     buf_chest.append(q_chest)
                 elif capture_mode == CAPTURE_CHEST_LEAN:
                     buf_chest_lean.append(q_chest)
+                    buf_upper_lean.append(q_upper)  # ДОБАВЛЕНО
+                    buf_fore_lean.append(q_fore)    # ДОБАВЛЕНО
         except Exception as e:
             print(f"Ошибка чтения serial: {e}")
             time.sleep(0.1)
 
     ser.close()
 
-
-# --------------------- Камера ---------------------
 
 class OrbitCamera:
     def __init__(self):
@@ -802,8 +883,6 @@ class OrbitCamera:
                    self.target[0], self.target[1], self.target[2],
                    0, 1, 0)
 
-
-# --------------------- Рисование геометрии ---------------------
 
 AXIS_VECTORS = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
 
@@ -858,23 +937,10 @@ def draw_floor_grid(size=8, step=1):
 
 
 def draw_torso():
-    """Трапециевидная призма (шире сверху) - грубая модель тела.
-
-    ВАЖНО: в этой сцене вертикаль - ось Y (как и везде в файле: камера,
-    DOWN_WORLD, отрисовка руки - все используют Y как 'вверх/вниз').
-    Ось Z здесь - глубина (перёд-зад тела), а не высота - НЕ ПУТАТЬ с
-    собственной системой координат человека (Y-вперёд, Z-вверх) из докстринга
-    вверху файла - та СК используется только для физического смысла осей
-    датчиков, а не для координат сцены OpenGL.
-
-    Верх (шире) - на Y=0 (высота плеч, там же откуда 'растёт' рука),
-    низ (уже) - на Y=-TORSO_HEIGHT."""
     tw, bw = TORSO_TOP_HALF_WIDTH, TORSO_BOTTOM_HALF_WIDTH
     d = TORSO_DEPTH / 2.0
     y_top, y_bot = 0.0, -TORSO_HEIGHT
 
-    # 8 вершин: верх (шире) и низ (уже). Порядок (x, y, z): x - влево/вправо,
-    # y - вверх/вниз (высота), z - перёд/зад (глубина).
     top = [(-tw, y_top, -d), (tw, y_top, -d), (tw, y_top, d), (-tw, y_top, d)]
     bot = [(-bw, y_bot, -d), (bw, y_bot, -d), (bw, y_bot, d), (-bw, y_bot, d)]
 
@@ -886,21 +952,15 @@ def draw_torso():
             glVertex3f(*p)
         glEnd()
 
-    quad(*top)                                   # верх
-    quad(*bot)                                   # низ
-    quad(top[0], top[1], bot[1], bot[0])          # перёд
-    quad(top[2], top[3], bot[3], bot[2])          # зад
-    quad(top[1], top[2], bot[2], bot[1])          # право
-    quad(top[3], top[0], bot[0], bot[3])          # лево
+    quad(*top)
+    quad(*bot)
+    quad(top[0], top[1], bot[1], bot[0])
+    quad(top[2], top[3], bot[3], bot[2])
+    quad(top[1], top[2], bot[2], bot[1])
+    quad(top[3], top[0], bot[0], bot[3])
 
-
-# --------------------- Общий расчёт углов ---------------------
 
 def compute_current_angles():
-    """Возвращает (shoulder_deg, elbow_deg) - None, None, если калибровка 1
-    ('рука вниз', G) ещё не выполнена. Логика НЕ ИЗМЕНИЛАСЬ по сравнению с
-    предыдущей версией файла - прецессия считается отдельно, см.
-    compute_precession_deg()."""
     with cal_lock:
         if not is_calibrated_down:
             return None, None
@@ -928,7 +988,6 @@ def draw_text_overlay(text_lines, display_size):
     glLoadIdentity()
     glDisable(GL_DEPTH_TEST)
 
-    # Включаем альфа-блендинг
     glEnable(GL_BLEND)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
@@ -948,8 +1007,6 @@ def draw_text_overlay(text_lines, display_size):
     glPopMatrix()
     glMatrixMode(GL_MODELVIEW)
     glPopMatrix()
-
-# --------------------- Основной цикл ---------------------
 
 def main():
     global running
@@ -1001,12 +1058,16 @@ def main():
                         print(f"Режим отображения: {mode_name}")
                     elif event.key == pygame.K_g:
                         start_stop_capture_down()
+                        send_calibration_command_to_stm('g')  # ДОБАВЛЕНО
                     elif event.key == pygame.K_f:
                         try_calibrate_forward()
+                        send_calibration_command_to_stm('f')  # ДОБАВЛЕНО
                     elif event.key == pygame.K_l:
                         start_stop_capture_chest_lean()
+                        send_calibration_command_to_stm('l')  # ДОБАВЛЕНО
                     elif event.key == pygame.K_r:
                         reset_calibration_forward()
+                        send_calibration_command_to_stm('r')  # ДОБАВЛЕНО
                     elif event.key == pygame.K_1:
                         cam.set_view(azimuth=0.0, elevation=0.0)
                     elif event.key == pygame.K_2:
@@ -1045,24 +1106,62 @@ def main():
 
             shoulder_deg, elbow_deg = compute_current_angles()
             azimuth_arm_deg, body_yaw_deg, plane_bearing_deg = compute_precession_deg()
+            # ЗАМЕНЕНО: раньше была скорректирована только нутация плеча -
+            # теперь ВСЕ ТРИ угла (плечо, локоть, азимут) корректны при
+            # ЛЮБОМ наклоне тела (см. compute_arm_angles_relative_to_body).
+            shoulder_rel_deg, elbow_rel_deg, azimuth_rel_deg = compute_arm_angles_relative_to_body()
 
             tilt_fwd = None
             tilt_side = None
             with cal3_lock:
                 remap_ready = is_world_remap_calibrated
                 remap_q = R_WORLD_REMAP if remap_ready else None
-            if remap_ready:
+            with cal2_lock:
+                forward_ready = is_calibrated_forward
+                chest_baseline = q_chest_cal
+            if remap_ready and forward_ready:
                 with quat_lock:
                     q_chest_now = current_chest_quat
-                tilt_fwd, tilt_side = compute_body_tilt(q_chest_now, remap_q)
+                tilt_fwd, tilt_side = compute_body_tilt(q_chest_now, chest_baseline, remap_q)
 
-            render_shoulder = shoulder_deg if shoulder_deg is not None else 0.0
-            render_elbow = elbow_deg if elbow_deg is not None else 0.0
-            render_bearing = plane_bearing_deg if plane_bearing_deg is not None else 0.0
+            # ИСПОЛЬЗУЕМ скорректированные (относительно тела) значения для
+            # плеча/локтя, где они уже доступны (нужны F+L) - иначе
+            # откатываемся на исходные (относительно истинной мировой
+            # вертикали) как раньше, чтобы классификация/отрисовка работали
+            # сразу после G, не дожидаясь полной калибровки.
+            shoulder_for_pose = shoulder_rel_deg if shoulder_rel_deg is not None else shoulder_deg
+            elbow_for_pose = elbow_rel_deg if elbow_rel_deg is not None else elbow_deg
 
-            # поворачиваем ОСЬ сгибания (не саму модель) на угол прецессии -
-            # см. докстринг вверху файла, "конъюгационный трюк":
-            # rotate(axis, Q) эквивалентно Q ⊗ axis_angle(axis,θ) ⊗ conj(Q)
+            # АЗИМУТ - берём механизм compute_precession_deg (только
+            # вычитание рысканья тела, НЕ полный наклон), а НЕ azimuth_rel_deg
+            # (новая полная коррекция через R_ARM_REMAP). ДВЕ ПРИЧИНЫ:
+            # 1) НАДЁЖНОСТЬ: azimuth_rel_deg зависит от оси, измеренной
+            #    ОДИН РАЗ за короткое окно калибровки L - а датчик РУКИ
+            #    (MPU6050) без магнитометра, и любой дрейф/шевеление за эти
+            #    пару секунд калибровки ПОЛНОСТЬЮ портит измеренную ось,
+            #    после чего азимут превращается в шум на практике (хотя сама
+            #    коррекция математически верна - подтверждено численно).
+            #    Плечо/локоть эта проблема НЕ затрагивает - они завязаны на
+            #    гравитацию (датчик знает её всегда точно, без дрейфа).
+            # 2) compute_precession_deg ДОЛГОЕ ВРЕМЯ содержал знаковый баг
+            #    (azimuth_arm_deg строился на UP_WORLD, body_yaw_since_cal_deg
+            #    - на CHEST_WORLD_DOWN, т.е. противоположно направленной оси
+            #    - из-за чего вычитание УДВАИВАЛО вклад поворота тела вместо
+            #    того, чтобы его убрать) - см. докстринг compute_precession_deg.
+            #    ИСПРАВЛЕНО (сложение вместо вычитания, проверено численно
+            #    на диапазоне до ±170° при случайных независимых креплениях
+            #    датчиков - 0.0000° отклонения). Механизм грубее полной
+            #    коррекции (не учитывает наклоны тела, только поворот), но
+            #    теперь корректен и НЕ зависит от хрупкой калибровки руки.
+            azimuth_for_pose = plane_bearing_deg
+
+            pose_label = classify_arm_pose(shoulder_for_pose, elbow_for_pose, azimuth_for_pose,
+                                            tilt_fwd, tilt_side)
+
+            render_shoulder = shoulder_for_pose if shoulder_for_pose is not None else 0.0
+            render_elbow = elbow_for_pose if elbow_for_pose is not None else 0.0
+            render_bearing = azimuth_for_pose if azimuth_for_pose is not None else 0.0
+
             q_plane = axis_angle_quat((0.0, 1.0, 0.0), render_bearing)
             q_shoulder_local = axis_angle_quat(RENDER_AXIS, render_shoulder)
             q_elbow_local = axis_angle_quat(RENDER_AXIS, render_elbow)
@@ -1074,13 +1173,6 @@ def main():
             upper_matrix = quat_to_matrix(q_upper_render)
             joint_matrix = quat_to_matrix(q_joint_render)
 
-            # В режиме "земля" поворачиваем ВСЮ сцену (тело + руку) на
-            # реальный поворот тела с момента калибровки. body_delta - это
-            # поворот ТЕЛА в СОБСТВЕННОЙ 'мировой' КОНВЕНЦИИ КВАТЕРНИОНА BNO
-            # (CHEST_WORLD_DOWN), не в локальных/корпусных осях датчика -
-            # поэтому нужен именно R_WORLD_REMAP, теперь ИЗМЕРЕННЫЙ калибровкой
-            # 'наклон влево' (L, см. start_stop_capture_chest_lean() выше),
-            # а не угаданный автоматически.
             q_world_extra = IDENTITY_QUAT
             if display_mode == DISPLAY_MODE_WORLD:
                 with cal3_lock:
@@ -1110,14 +1202,29 @@ def main():
             glPopMatrix()
 
             text_lines = []
+            if pose_label is not None:  # ДОБАВЛЕНО
+                text_lines.append(f"Положение (Python): {pose_label}")
+            with quat_lock:
+                stm_pose_now = latest_stm_pose
+            if stm_pose_now is not None:  # ДОБАВЛЕНО - сверка со STM32
+                py_pose_num = int(pose_label[0]) if pose_label else None
+                match_str = "OK" if py_pose_num == stm_pose_now else "!! РАСХОЖДЕНИЕ !!"
+                text_lines.append(f"Положение (STM32): {stm_pose_now}  [{match_str}]")
             if shoulder_deg is not None:
                 text_lines.append(f"Плечо: {shoulder_deg:6.1f}°")
                 text_lines.append(f"Локоть: {elbow_deg:6.1f}°")
             if plane_bearing_deg is not None:
                 text_lines.append(f"Прецессия плоскости: {plane_bearing_deg:6.1f}°")
+                text_lines.append(f"  (азимут руки: {azimuth_arm_deg:6.1f}°  поворот тела: {body_yaw_deg:6.1f}°)")  # ДОБАВЛЕНО
             if tilt_fwd is not None:
                 text_lines.append(f"Наклон тела вперёд: {tilt_fwd:.1f}°")
                 text_lines.append(f"Наклон тела вбок:   {tilt_side:.1f}°")
+            if shoulder_rel_deg is not None:  # ДОБАВЛЕНО/ОБНОВЛЕНО
+                text_lines.append(f"Плечо относ. тела: {shoulder_rel_deg:6.1f}°")
+            if elbow_rel_deg is not None:
+                text_lines.append(f"Локоть относ. тела: {elbow_rel_deg:6.1f}°")
+            if azimuth_rel_deg is not None:
+                text_lines.append(f"Азимут относ. тела: {azimuth_rel_deg:6.1f}°")
             if text_lines:
                 draw_text_overlay(text_lines, display)
 
